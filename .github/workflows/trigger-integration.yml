@@ -1,0 +1,24 @@
+name: trigger-integration
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger vnt-integration
+        env:
+          GH_TOKEN: ${{ secrets.VNT_INTEGRATION_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "Missing VNT_INTEGRATION_TOKEN"
+            exit 1
+          fi
+          curl -sS -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/middlescale/vnt-integration/dispatches \
+            -d "{\"event_type\":\"vnts_push\",\"client_payload\":{\"vnt_ref\":\"main\",\"vnts_ref\":\"${GITHUB_REF_NAME}\"}}"
