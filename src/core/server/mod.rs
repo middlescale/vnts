@@ -6,7 +6,7 @@ use tokio::net::{TcpListener, UdpSocket};
 use crate::cipher::RsaCipher;
 use crate::core::server::wire_guard::WireGuardGroup;
 use crate::core::service::PacketHandler;
-use crate::core::store::cache::AppCache;
+use crate::core::control::controller::Controller;
 use crate::ConfigInfo;
 
 mod tcp;
@@ -24,21 +24,21 @@ pub async fn start(
     rsa_cipher: Option<RsaCipher>,
 ) -> io::Result<()> {
     let udp = Arc::new(UdpSocket::from_std(udp)?);
-    let cache = AppCache::new();
+    let controller = Controller::new();
     let handler = PacketHandler::new(
-        cache.clone(),
+        controller.clone(),
         config.clone(),
         rsa_cipher.clone(),
         udp.clone(),
     );
-    let wg = WireGuardGroup::new(cache.clone(), config.clone(), udp.clone());
+    let wg = WireGuardGroup::new(controller.clone(), config.clone(), udp.clone());
     let tcp_handle = tokio::spawn(tcp::start(TcpListener::from_std(tcp)?, handler.clone()));
     let udp_handle = tokio::spawn(udp::start(udp, handler.clone(), wg));
     #[cfg(not(feature = "web"))]
     let _ = tokio::try_join!(tcp_handle, udp_handle);
     #[cfg(feature = "web")]
     if let Some(http) = http {
-        if let Err(e) = web::start(http, cache, config).await {
+        if let Err(e) = web::start(http, controller, config).await {
             log::error!("{:?}", e);
         }
     } else {

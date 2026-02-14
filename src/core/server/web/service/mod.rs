@@ -17,18 +17,18 @@ use crate::core::server::web::vo::res::{
     ClientInfo, ClientStatusInfo, GroupList, NetworkInfo, WGData, WgConfig,
 };
 use crate::core::service::server::{generate_ip, RegisterClientRequest};
-use crate::core::store::cache::AppCache;
+use crate::core::control::controller::Controller;
 use crate::ConfigInfo;
 
 #[derive(Clone)]
 pub struct VntsWebService {
-    cache: AppCache,
+    cache: Controller,
     config: ConfigInfo,
     login_time: Arc<AtomicCell<(Instant, usize)>>,
 }
 
 impl VntsWebService {
-    pub fn new(cache: AppCache, config: ConfigInfo) -> Self {
+    pub fn new(cache: Controller, config: ConfigInfo) -> Self {
         Self {
             cache,
             config,

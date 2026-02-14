@@ -14,7 +14,7 @@ use tokio::sync::mpsc::Sender;
 
 use crate::cipher::{Aes256GcmCipher, Finger, RsaCipher};
 use crate::core::entity::{ClientInfo, ClientStatusInfo, NetworkInfo, SimpleClientInfo};
-use crate::core::store::cache::{AppCache, LinkVntContext, VntContext};
+use crate::core::control::controller::{Controller, LinkVntContext, VntContext};
 use crate::error::*;
 use crate::proto::message;
 use crate::proto::message::{DeviceList, RegistrationRequest, RegistrationResponse};
@@ -25,7 +25,7 @@ use crate::{protocol, ConfigInfo};
 
 #[derive(Clone)]
 pub struct ServerPacketHandler {
-    cache: AppCache,
+    cache: Controller,
     config: ConfigInfo,
     rsa_cipher: Option<RsaCipher>,
     udp: Arc<UdpSocket>,
@@ -33,7 +33,7 @@ pub struct ServerPacketHandler {
 
 impl ServerPacketHandler {
     pub fn new(
-        cache: AppCache,
+        cache: Controller,
         config: ConfigInfo,
         rsa_cipher: Option<RsaCipher>,
         udp: Arc<UdpSocket>,
@@ -664,7 +664,7 @@ pub struct RegisterClientResponse {
 }
 
 pub async fn generate_ip(
-    cache: &AppCache,
+    cache: &Controller,
     register_request: RegisterClientRequest,
 ) -> anyhow::Result<RegisterClientResponse> {
     let gateway: u32 = register_request.gateway.into();

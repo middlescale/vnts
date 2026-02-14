@@ -1,6 +1,6 @@
 use crate::core::server::wire_guard::WireGuardGroup;
 use crate::core::service::PacketHandler;
-use crate::core::store::cache::VntContext;
+use crate::core::control::controller::VntContext;
 use crate::protocol::NetPacket;
 use parking_lot::Mutex;
 use std::collections::HashMap;

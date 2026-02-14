@@ -1,5 +1,5 @@
 use crate::core::service::PacketHandler;
-use crate::core::store::cache::VntContext;
+use crate::core::control::controller::VntContext;
 use crate::protocol::NetPacket;
 use std::io;
 use std::net::SocketAddr;

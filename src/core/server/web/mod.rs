@@ -11,7 +11,7 @@ use crate::core::server::web::service::VntsWebService;
 use crate::core::server::web::vo::req::{CreateWGData, LoginData, RemoveClientReq};
 
 use crate::core::server::web::vo::ResponseMessage;
-use crate::core::store::cache::AppCache;
+use crate::core::control::controller::Controller;
 use crate::ConfigInfo;
 
 mod service;
@@ -73,7 +73,7 @@ async fn group_info(
 
 pub async fn start(
     lst: net::TcpListener,
-    cache: AppCache,
+    cache: Controller,
     config: ConfigInfo,
 ) -> std::io::Result<()> {
     let web_service = VntsWebService::new(cache, config);

@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::cipher::RsaCipher;
-use crate::core::store::cache::{AppCache, LinkVntContext, VntContext};
+use crate::core::control::controller::{Controller, LinkVntContext, VntContext};
 use crate::error::*;
 use crate::protocol::NetPacket;
 use crate::ConfigInfo;
@@ -13,7 +13,7 @@ use tokio::sync::mpsc::Sender;
 
 #[derive(Clone)]
 pub struct ClientPacketHandler {
-    cache: AppCache,
+    cache: Controller,
     config: ConfigInfo,
     rsa_cipher: Option<RsaCipher>,
     udp: Arc<UdpSocket>,
@@ -21,7 +21,7 @@ pub struct ClientPacketHandler {
 
 impl ClientPacketHandler {
     pub fn new(
-        cache: AppCache,
+        cache: Controller,
         config: ConfigInfo,
         rsa_cipher: Option<RsaCipher>,
         udp: Arc<UdpSocket>,

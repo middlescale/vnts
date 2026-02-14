@@ -6,10 +6,10 @@ use std::time::Duration;
 
 use crate::cipher::Aes256GcmCipher;
 use crate::core::entity::{NetworkInfo, WireGuardConfig};
-use crate::core::store::expire_map::ExpireMap;
+use crate::core::control::expire_map::ExpireMap;
 
 #[derive(Clone)]
-pub struct AppCache {
+pub struct Controller {
     // group -> NetworkInfo
     pub virtual_network: ExpireMap<String, Arc<RwLock<NetworkInfo>>>,
     // (group,ip) -> addr  用于客户端过期，只有客户端离线才设置
@@ -35,12 +35,12 @@ pub struct LinkVntContext {
     pub timestamp: i64,
 }
 impl VntContext {
-    pub async fn leave(self, cache: &AppCache) {
+    pub async fn leave(self, controller: &Controller) {
         if self.server_cipher.is_some() {
-            cache.cipher_session.remove(&self.link_address);
+            controller.cipher_session.remove(&self.link_address);
         }
         if let Some(context) = self.link_context {
-            if let Some(network_info) = cache.virtual_network.get(&context.group) {
+            if let Some(network_info) = controller.virtual_network.get(&context.group) {
                 {
                     let mut guard = network_info.write();
                     if let Some(client_info) = guard.clients.get_mut(&context.virtual_ip) {
@@ -55,7 +55,7 @@ impl VntContext {
                     }
                     drop(guard);
                 }
-                cache
+                controller
                     .insert_ip_session((context.group, context.virtual_ip), self.link_address)
                     .await;
             }
@@ -63,7 +63,7 @@ impl VntContext {
     }
 }
 
-impl AppCache {
+impl Controller {
     pub fn new() -> Self {
         let wg_group_map: Arc<DashMap<[u8; 32], WireGuardConfig>> = Default::default();
         // 网段7天未使用则回收
@@ -109,7 +109,7 @@ impl AppCache {
     }
 }
 
-impl AppCache {
+impl Controller {
     pub async fn insert_cipher_session(&self, key: SocketAddr, value: Aes256GcmCipher) {
         self.cipher_session.insert(key, Arc::new(value));
     }
