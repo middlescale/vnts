@@ -5,47 +5,57 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::cipher::Aes256GcmCipher;
-use crate::core::entity::{NetworkInfo, WireGuardConfig};
 use crate::core::control::expire_map::ExpireMap;
+use crate::core::entity::{NetworkInfo, SimpleClientInfo, WireGuardConfig};
 
-#[derive(Clone)]
-pub struct Controller {
-    // group -> NetworkInfo
-    pub virtual_network: ExpireMap<String, Arc<RwLock<NetworkInfo>>>,
-    // (group,ip) -> addr  用于客户端过期，只有客户端离线才设置
-    pub ip_session: ExpireMap<(String, u32), SocketAddr>,
-    // 加密密钥
-    pub cipher_session: Arc<DashMap<SocketAddr, Arc<Aes256GcmCipher>>>,
-    // web登录状态
-    pub auth_map: ExpireMap<String, ()>,
-    // wg公钥 -> wg配置
-    pub wg_group_map: Arc<DashMap<[u8; 32], WireGuardConfig>>,
+pub struct VntSession {
+    network_info: Option<SessionNetworkInfo>,
+    server_cipher: Option<Aes256GcmCipher>,
+    address: SocketAddr,
 }
-
-pub struct VntContext {
-    pub link_context: Option<LinkVntContext>,
-    pub server_cipher: Option<Aes256GcmCipher>,
-    pub link_address: SocketAddr,
-}
-pub struct LinkVntContext {
-    pub network_info: Arc<RwLock<NetworkInfo>>,
+pub struct SessionNetworkInfo {
     pub group: String,
     pub virtual_ip: u32,
     pub broadcast: Ipv4Addr,
     pub timestamp: i64,
 }
-impl VntContext {
+
+impl VntSession {
+    pub fn new(address: SocketAddr) -> Self {
+        Self {
+            network_info: None,
+            server_cipher: None,
+            address,
+        }
+    }
+
+    pub fn address(&self) -> &SocketAddr {
+        &self.address
+    }
+
+    pub fn network_info(&self) -> Option<&SessionNetworkInfo> {
+        self.network_info.as_ref()
+    }
+    pub fn set_network_info(&mut self, network_info: SessionNetworkInfo) {
+        self.network_info.replace(network_info);
+    }
+    pub fn server_cipher(&self) -> Option<&Aes256GcmCipher> {
+        self.server_cipher.as_ref()
+    }
+    pub fn set_server_cipher(&mut self, server_cipher: Aes256GcmCipher) {
+        self.server_cipher.replace(server_cipher);
+    }
     pub async fn leave(self, controller: &Controller) {
         if self.server_cipher.is_some() {
-            controller.cipher_session.remove(&self.link_address);
+            controller.remove_cipher_session(&self.address);
         }
-        if let Some(context) = self.link_context {
-            if let Some(network_info) = controller.virtual_network.get(&context.group) {
+        if let Some(network_context) = self.network_info {
+            if let Some(network_info) = controller.get_network_info(&network_context.group) {
                 {
                     let mut guard = network_info.write();
-                    if let Some(client_info) = guard.clients.get_mut(&context.virtual_ip) {
-                        if client_info.address != self.link_address
-                            && client_info.timestamp != context.timestamp
+                    if let Some(client_info) = guard.clients.get_mut(&network_context.virtual_ip) {
+                        if client_info.address != self.address
+                            && client_info.timestamp != network_context.timestamp
                         {
                             return;
                         }
@@ -56,11 +66,28 @@ impl VntContext {
                     drop(guard);
                 }
                 controller
-                    .insert_ip_session((context.group, context.virtual_ip), self.link_address)
+                    .insert_ip_session(
+                        (network_context.group, network_context.virtual_ip),
+                        self.address,
+                    )
                     .await;
             }
         }
     }
+}
+
+#[derive(Clone)]
+pub struct Controller {
+    // group -> NetworkInfo
+    virtual_network: ExpireMap<String, Arc<RwLock<NetworkInfo>>>,
+    // (group,ip) -> addr  用于客户端过期，只有客户端离线才设置
+    ip_session: ExpireMap<(String, u32), SocketAddr>,
+    // 加密密钥
+    cipher_session: Arc<DashMap<SocketAddr, Arc<Aes256GcmCipher>>>,
+    // web登录状态
+    auth_map: ExpireMap<String, ()>,
+    // wg公钥 -> wg配置
+    wg_group_map: Arc<DashMap<[u8; 32], WireGuardConfig>>,
 }
 
 impl Controller {
@@ -110,8 +137,62 @@ impl Controller {
 }
 
 impl Controller {
+    pub fn get_network_info(&self, group: &str) -> Option<Arc<RwLock<NetworkInfo>>> {
+        self.virtual_network.get(&group.to_string())
+    }
+    pub fn remove_network_info(&self, group: &str) -> Option<Arc<RwLock<NetworkInfo>>> {
+        self.virtual_network.remove(&group.to_string())
+    }
+    pub fn network_groups(&self) -> Vec<(String, Arc<RwLock<NetworkInfo>>)> {
+        self.virtual_network.key_values()
+    }
+    pub fn all_client_info(&self) -> Vec<(String, Vec<SimpleClientInfo>)> {
+        self.network_groups()
+            .into_iter()
+            .map(|(group, network_info)| {
+                let clients = network_info
+                    .read()
+                    .clients
+                    .values()
+                    .map(SimpleClientInfo::from)
+                    .collect();
+                (group, clients)
+            })
+            .collect()
+    }
+    pub async fn get_or_create_network_info<F>(
+        &self,
+        group: String,
+        f: F,
+    ) -> Arc<RwLock<NetworkInfo>>
+    where
+        F: FnOnce() -> (Duration, Arc<RwLock<NetworkInfo>>),
+    {
+        self.virtual_network.optionally_get_with(group, f).await
+    }
+    pub async fn insert_auth(&self, auth: String, expire: Duration) {
+        self.auth_map.insert(auth, (), expire).await;
+    }
+    pub fn contains_auth(&self, auth: &str) -> bool {
+        self.auth_map.get(&auth.to_string()).is_some()
+    }
+    pub fn insert_wg_group(&self, public_key: [u8; 32], wireguard_config: WireGuardConfig) {
+        self.wg_group_map.insert(public_key, wireguard_config);
+    }
+    pub fn get_wg_group(&self, public_key: &[u8; 32]) -> Option<WireGuardConfig> {
+        self.wg_group_map.get(public_key).map(|v| v.clone())
+    }
+    pub fn remove_wg_group(&self, public_key: &[u8; 32]) -> Option<WireGuardConfig> {
+        self.wg_group_map.remove(public_key).map(|(_, v)| v)
+    }
     pub async fn insert_cipher_session(&self, key: SocketAddr, value: Aes256GcmCipher) {
         self.cipher_session.insert(key, Arc::new(value));
+    }
+    pub fn get_cipher_session(&self, key: &SocketAddr) -> Option<Arc<Aes256GcmCipher>> {
+        self.cipher_session.get(key).map(|v| v.clone())
+    }
+    pub fn remove_cipher_session(&self, key: &SocketAddr) -> Option<Arc<Aes256GcmCipher>> {
+        self.cipher_session.remove(key).map(|(_, v)| v)
     }
     pub async fn insert_ip_session(&self, key: (String, u32), value: SocketAddr) {
         self.ip_session

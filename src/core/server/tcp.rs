@@ -1,5 +1,5 @@
+use crate::core::control::controller::VntSession;
 use crate::core::service::PacketHandler;
-use crate::core::control::controller::VntContext;
 use crate::protocol::NetPacket;
 use std::io;
 use std::net::SocketAddr;
@@ -74,22 +74,17 @@ async fn stream_handle(stream: TcpStream, addr: SocketAddr, handler: PacketHandl
         let _ = w.shutdown().await;
     });
     tokio::spawn(async move {
-        let mut context = VntContext {
-            link_context: None,
-            server_cipher: None,
-            link_address: addr,
-        };
-        if let Err(e) = tcp_read(&mut context, r, addr, sender, &handler).await {
+        let mut session = VntSession::new(addr);
+        if let Err(e) = tcp_read(&mut session, r, sender, &handler).await {
             log::warn!("tcp_read {:?}", e)
         }
-        handler.leave(context).await;
+        handler.leave(session).await;
     });
 }
 
 async fn tcp_read(
-    context: &mut VntContext,
+    session: &mut VntSession,
     mut read: OwnedReadHalf,
-    addr: SocketAddr,
     sender: Sender<Vec<u8>>,
     handler: &PacketHandler,
 ) -> io::Result<()> {
@@ -100,7 +95,7 @@ async fn tcp_read(
     loop {
         read.read_exact(&mut head).await?;
         if head[0] != 0 {
-            log::warn!("tcp数据流错误 来源地址 {}", addr);
+            log::warn!("tcp数据流错误 来源地址 {}", session.address());
             return Ok(());
         }
         let len = ((head[1] as usize) << 16) | ((head[2] as usize) << 8) | head[3] as usize;
@@ -112,7 +107,7 @@ async fn tcp_read(
         }
         read.read_exact(&mut buf[..len]).await?;
         let packet = NetPacket::new0(len, &mut buf)?;
-        if let Some(rs) = handler.handle(context, packet, addr, &sender).await {
+        if let Some(rs) = handler.handle(session, packet, &sender).await {
             if sender
                 .as_ref()
                 .unwrap()

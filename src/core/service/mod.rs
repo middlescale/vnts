@@ -1,11 +1,10 @@
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::Sender;
 
 use crate::cipher::RsaCipher;
-use crate::core::control::controller::{Controller, VntContext};
+use crate::core::control::controller::{Controller, VntSession};
 use crate::core::service::client::ClientPacketHandler;
 use crate::core::service::server::ServerPacketHandler;
 use crate::error::*;
@@ -43,22 +42,19 @@ impl PacketDispatcher {
             ServerPacketHandler::new(controller.clone(), config.clone(), rsa_cipher.clone(), udp);
         Self { client, server }
     }
-    pub async fn leave(&self, context: VntContext) {
-        self.server.leave(context).await;
+    pub async fn leave(&self, session: VntSession) {
+        self.server.leave(session).await;
     }
     async fn handle<B: AsRef<[u8]> + AsMut<[u8]>>(
         &self,
-        context: &mut VntContext,
+        session: &mut VntSession,
         net_packet: NetPacket<B>,
-        addr: SocketAddr,
         tcp_sender: &Option<Sender<Vec<u8>>>,
     ) -> Result<Option<NetPacket<Vec<u8>>>> {
         if net_packet.is_gateway() {
-            self.server
-                .handle(context, net_packet, addr, tcp_sender)
-                .await
+            self.server.handle(session, net_packet, tcp_sender).await
         } else {
-            self.client.handle(context, net_packet, addr).await?;
+            self.client.handle(session, net_packet).await?;
             Ok(None)
         }
     }
@@ -75,21 +71,20 @@ impl PacketHandler {
             dispatcher: PacketDispatcher::new(controller, config, rsa_cipher, udp),
         }
     }
-    pub async fn leave(&self, context: VntContext) {
-        self.dispatcher.leave(context).await;
+    pub async fn leave(&self, session: VntSession) {
+        self.dispatcher.leave(session).await;
     }
     pub async fn handle<B: AsRef<[u8]> + AsMut<[u8]>>(
         &self,
-        context: &mut VntContext,
+        session: &mut VntSession,
         net_packet: NetPacket<B>,
-        addr: SocketAddr,
         tcp_sender: &Option<Sender<Vec<u8>>>,
     ) -> Option<NetPacket<Vec<u8>>> {
         self.dispatcher
-            .handle(context, net_packet, addr, tcp_sender)
+            .handle(session, net_packet, tcp_sender)
             .await
             .unwrap_or_else(|e| {
-                log::error!("addr={},{:?}", addr, e);
+                log::error!("addr={},{:?}", session.address(), e);
                 None
             })
     }

@@ -13,8 +13,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc::Sender;
 
 use crate::cipher::{Aes256GcmCipher, Finger, RsaCipher};
+use crate::core::control::controller::{Controller, SessionNetworkInfo, VntSession};
 use crate::core::entity::{ClientInfo, ClientStatusInfo, NetworkInfo, SimpleClientInfo};
-use crate::core::control::controller::{Controller, LinkVntContext, VntContext};
 use crate::error::*;
 use crate::proto::message;
 use crate::proto::message::{DeviceList, RegistrationRequest, RegistrationResponse};
@@ -25,7 +25,7 @@ use crate::{protocol, ConfigInfo};
 
 #[derive(Clone)]
 pub struct ServerPacketHandler {
-    cache: Controller,
+    controller: Controller,
     config: ConfigInfo,
     rsa_cipher: Option<RsaCipher>,
     udp: Arc<UdpSocket>,
@@ -33,13 +33,13 @@ pub struct ServerPacketHandler {
 
 impl ServerPacketHandler {
     pub fn new(
-        cache: Controller,
+        controller: Controller,
         config: ConfigInfo,
         rsa_cipher: Option<RsaCipher>,
         udp: Arc<UdpSocket>,
     ) -> Self {
         Self {
-            cache,
+            controller,
             config,
             rsa_cipher,
             udp,
@@ -48,14 +48,13 @@ impl ServerPacketHandler {
 }
 
 impl ServerPacketHandler {
-    pub async fn leave(&self, context: VntContext) {
-        context.leave(&self.cache).await;
+    pub async fn leave(&self, session: VntSession) {
+        session.leave(&self.controller).await;
     }
     pub async fn handle<B: AsRef<[u8]> + AsMut<[u8]>>(
         &self,
-        context: &mut VntContext,
+        session: &mut VntSession,
         mut net_packet: NetPacket<B>,
-        addr: SocketAddr,
         tcp_sender: &Option<Sender<Vec<u8>>>,
     ) -> Result<Option<NetPacket<Vec<u8>>>> {
         // 握手请求直接处理
@@ -64,13 +63,13 @@ impl ServerPacketHandler {
             match protocol::service_packet::Protocol::from(net_packet.transport_protocol()) {
                 service_packet::Protocol::HandshakeRequest => {
                     // 回应握手
-                    let mut rs = self.handshake(net_packet, addr)?;
+                    let mut rs = self.handshake(net_packet, session.address())?;
                     self.common_param(&mut rs, source);
                     return Ok(Some(rs));
                 }
                 service_packet::Protocol::SecretHandshakeRequest => {
                     // 加密握手
-                    let rs = self.secret_handshake(context, net_packet, addr).await?;
+                    let rs = self.secret_handshake(session, net_packet).await?;
                     return Ok(Some(rs));
                 }
                 _ => {}
@@ -79,15 +78,23 @@ impl ServerPacketHandler {
         // 解密
         let server_secret = net_packet.is_encrypt();
         if server_secret {
-            if let Some(aes) = &context.server_cipher {
+            if let Some(aes) = session.server_cipher() {
                 aes.decrypt_ipv4(&mut net_packet)?;
             } else {
-                log::info!("没有密钥:{},head={:?}", addr, net_packet.head());
-                return Ok(Some(self.handle_err(addr, source, &Error::NoKey)?));
+                log::info!(
+                    "没有密钥:{},head={:?}",
+                    session.address(),
+                    net_packet.head()
+                );
+                return Ok(Some(self.handle_err(
+                    session.address(),
+                    source,
+                    &Error::NoKey,
+                )?));
             }
         }
         let mut packet = match self
-            .handle0(context, net_packet, addr, tcp_sender, server_secret)
+            .handle0(session, net_packet, tcp_sender, server_secret)
             .await
         {
             Ok(rs) => {
@@ -97,11 +104,11 @@ impl ServerPacketHandler {
                     return Ok(None);
                 }
             }
-            Err(e) => self.handle_anyhow_err(addr, source, e)?,
+            Err(e) => self.handle_anyhow_err(session.address(), source, e)?,
         };
         self.common_param(&mut packet, source);
         if server_secret {
-            if let Some(aes) = &context.server_cipher {
+            if let Some(aes) = session.server_cipher() {
                 aes.encrypt_ipv4(&mut packet)?;
             }
         }
@@ -121,7 +128,7 @@ impl ServerPacketHandler {
     }
     fn handle_anyhow_err(
         &self,
-        addr: SocketAddr,
+        addr: &SocketAddr,
         source: Ipv4Addr,
         e: anyhow::Error,
     ) -> Result<NetPacket<Vec<u8>>> {
@@ -133,7 +140,7 @@ impl ServerPacketHandler {
     }
     fn handle_err(
         &self,
-        addr: SocketAddr,
+        addr: &SocketAddr,
         source: Ipv4Addr,
         e: &Error,
     ) -> Result<NetPacket<Vec<u8>>> {
@@ -173,15 +180,14 @@ impl ServerPacketHandler {
     }
     async fn handle0<B: AsRef<[u8]> + AsMut<[u8]>>(
         &self,
-        context: &mut VntContext,
+        session: &mut VntSession,
         net_packet: NetPacket<B>,
-        addr: SocketAddr,
         tcp_sender: &Option<Sender<Vec<u8>>>,
         server_secret: bool,
     ) -> Result<Option<NetPacket<Vec<u8>>>> {
         // 处理不需要连接上下文的请求
         let mut net_packet = match self
-            .not_context(context, net_packet, addr, tcp_sender, server_secret)
+            .not_context(session, net_packet, tcp_sender, server_secret)
             .await
         {
             Ok(rs) => {
@@ -190,7 +196,7 @@ impl ServerPacketHandler {
             Err(net_packet) => net_packet,
         };
         // 需要连接的上下文
-        let link_context = if let Some(link_context) = &context.link_context {
+        let link_context = if let Some(link_context) = session.network_info() {
             link_context
         } else {
             return Err(Error::Disconnect)?;
@@ -201,7 +207,7 @@ impl ServerPacketHandler {
                 match protocol::service_packet::Protocol::from(net_packet.transport_protocol()) {
                     service_packet::Protocol::PullDeviceList => {
                         //拉取网段设备信息
-                        return self.poll_device_list(net_packet, addr, &link_context);
+                        return self.poll_device_list(net_packet, session.address(), &link_context);
                     }
                     service_packet::Protocol::ClientStatusInfo => {
                         //客户端上报信息
@@ -276,9 +282,8 @@ impl ServerPacketHandler {
 impl ServerPacketHandler {
     async fn not_context<B: AsRef<[u8]>>(
         &self,
-        context: &mut VntContext,
+        session: &mut VntSession,
         net_packet: NetPacket<B>,
-        addr: SocketAddr,
         tcp_sender: &Option<Sender<Vec<u8>>>,
         server_secret: bool,
     ) -> result::Result<Result<Option<NetPacket<Vec<u8>>>>, NetPacket<B>> {
@@ -288,14 +293,14 @@ impl ServerPacketHandler {
             {
                 //注册
                 return Ok(self
-                    .register(context, net_packet, addr, tcp_sender, server_secret)
+                    .register(session, net_packet, tcp_sender, server_secret)
                     .await);
             }
         } else if net_packet.protocol() == Protocol::Control {
             if let control_packet::Protocol::AddrRequest =
                 protocol::control_packet::Protocol::from(net_packet.transport_protocol())
             {
-                return Ok(self.control_addr_request(addr));
+                return Ok(self.control_addr_request(session.address()));
             }
         }
         Err(net_packet)
@@ -303,10 +308,19 @@ impl ServerPacketHandler {
 }
 
 impl ServerPacketHandler {
+    fn get_network_info(
+        &self,
+        context: &SessionNetworkInfo,
+    ) -> Result<Arc<parking_lot::RwLock<NetworkInfo>>> {
+        self.controller
+            .get_network_info(&context.group)
+            .context("virtual_network is none")
+    }
+
     fn control_ping<B: AsRef<[u8]>>(
         &self,
         net_packet: NetPacket<B>,
-        context: &LinkVntContext,
+        network_info: &SessionNetworkInfo,
     ) -> Result<Option<NetPacket<Vec<u8>>>> {
         let vec = vec![0u8; 12 + 4 + ENCRYPTION_RESERVED];
         let mut packet = NetPacket::new_encrypt(vec)?;
@@ -314,12 +328,14 @@ impl ServerPacketHandler {
         packet.set_transport_protocol(control_packet::Protocol::Pong.into());
         packet.set_payload(net_packet.payload())?;
         let mut pong_packet = control_packet::PongPacket::new(packet.payload_mut())?;
-        let epoch = context.network_info.read().epoch;
+        let network_info = self.get_network_info(network_info)?;
+        let epoch = network_info.read().epoch;
         // 这里给客户端的是丢失精度的，可能导致客户端无法感知变更
         pong_packet.set_epoch(epoch as u16);
         Ok(Some(packet))
     }
-    fn control_addr_request(&self, addr: SocketAddr) -> Result<Option<NetPacket<Vec<u8>>>> {
+
+    fn control_addr_request(&self, addr: &SocketAddr) -> Result<Option<NetPacket<Vec<u8>>>> {
         let ipv4 = match addr.ip() {
             IpAddr::V4(ipv4) => ipv4,
             IpAddr::V6(ip) => {
@@ -343,9 +359,8 @@ impl ServerPacketHandler {
 impl ServerPacketHandler {
     async fn register<B: AsRef<[u8]>>(
         &self,
-        context: &mut VntContext,
+        session: &mut VntSession,
         net_packet: NetPacket<B>,
-        addr: SocketAddr,
         tcp_sender: &Option<Sender<Vec<u8>>>,
         server_secret: bool,
     ) -> Result<Option<NetPacket<Vec<u8>>>> {
@@ -354,7 +369,7 @@ impl ServerPacketHandler {
         check_reg(&request)?;
         log::info!(
             "register,{},id={:?},name={:?},version={:?},virtual_ip={},client_secret={},allow_ip_change={},is_fast={},tcp={}",
-            addr,
+            session.address(),
             request.device_id,
             request.name,
             request.version,
@@ -379,6 +394,7 @@ impl ServerPacketHandler {
         }
         let mut response = RegistrationResponse::new();
         //公网地址
+        let addr = session.address();
         response.public_port = addr.port() as u32;
         match addr.ip() {
             IpAddr::V4(ipv4) => {
@@ -404,12 +420,12 @@ impl ServerPacketHandler {
             client_secret: request.client_secret,
             client_secret_hash: request.client_secret_hash,
             server_secret,
-            address: addr,
+            address: *addr,
             tcp_sender: tcp_sender.clone(),
             online: true,
             wireguard: None,
         };
-        let register_response = generate_ip(&self.cache, register_client_request).await?;
+        let register_response = generate_ip(&self.controller, register_client_request).await?;
         let virtual_ip = register_response.virtual_ip.into();
         response.virtual_gateway = gateway.into();
         response.virtual_netmask = netmask.into();
@@ -420,12 +436,7 @@ impl ServerPacketHandler {
             .into_iter()
             .map(|v| v.into())
             .collect();
-        context.link_context.replace(LinkVntContext {
-            network_info: self
-                .cache
-                .virtual_network
-                .get(&group_id)
-                .context("virtual_network is none")?,
+        session.set_network_info(SessionNetworkInfo {
             group: group_id.clone(),
             virtual_ip,
             broadcast: config.broadcast,
@@ -462,7 +473,7 @@ impl ServerPacketHandler {
     fn handshake<B: AsRef<[u8]>>(
         &self,
         net_packet: NetPacket<B>,
-        addr: SocketAddr,
+        addr: &SocketAddr,
     ) -> Result<NetPacket<Vec<u8>>> {
         let req = message::HandshakeRequest::parse_from_bytes(net_packet.payload())?;
         log::info!("handshake:{},{}", addr, req);
@@ -486,11 +497,10 @@ impl ServerPacketHandler {
     }
     async fn secret_handshake<B: AsRef<[u8]>>(
         &self,
-        context: &mut VntContext,
+        session: &mut VntSession,
         net_packet: NetPacket<B>,
-        addr: SocketAddr,
     ) -> Result<NetPacket<Vec<u8>>> {
-        log::info!("secret_handshake:{}", addr);
+        log::info!("secret_handshake:{}", session.address());
         if let Some(rsp_cipher) = &self.rsa_cipher {
             let source = net_packet.source();
             let rsa_secret_body = rsp_cipher.decrypt(&net_packet)?;
@@ -506,8 +516,10 @@ impl ServerPacketHandler {
             packet.set_transport_protocol(service_packet::Protocol::SecretHandshakeResponse.into());
             self.common_param(&mut packet, source);
             c.encrypt_ipv4(&mut packet)?;
-            context.server_cipher.replace(c.clone());
-            self.cache.insert_cipher_session(addr, c).await;
+            session.set_server_cipher(c.clone());
+            self.controller
+                .insert_cipher_session(*session.address(), c)
+                .await;
             return Ok(packet);
         }
         Err(anyhow!("no encryption"))
@@ -518,11 +530,12 @@ impl ServerPacketHandler {
     fn poll_device_list<B: AsRef<[u8]>>(
         &self,
         _net_packet: NetPacket<B>,
-        _addr: SocketAddr,
-        context: &LinkVntContext,
+        _addr: &SocketAddr,
+        network_context: &SessionNetworkInfo,
     ) -> Result<Option<NetPacket<Vec<u8>>>> {
-        let guard = context.network_info.read();
-        let ips = clients_info(&guard.clients, context.virtual_ip);
+        let network_info = self.get_network_info(network_context)?;
+        let guard = network_info.read();
+        let ips = clients_info(&guard.clients, network_context.virtual_ip);
         let epoch = guard.epoch;
         drop(guard);
         let mut device_list = DeviceList::new();
@@ -539,7 +552,7 @@ impl ServerPacketHandler {
     fn up_client_status_info(
         &self,
         client_status_info: message::ClientStatusInfo,
-        context: &LinkVntContext,
+        network_info: &SessionNetworkInfo,
     ) {
         let mut status_info = ClientStatusInfo::default();
         let iplist = &mut status_info.p2p_list;
@@ -553,18 +566,19 @@ impl ServerPacketHandler {
         status_info.is_cone =
             client_status_info.nat_type.enum_value_or_default() == message::PunchNatType::Cone;
         status_info.update_time = Local::now();
-        if let Some(v) = context
-            .network_info
-            .write()
-            .clients
-            .get_mut(&client_status_info.source)
-        {
-            v.client_status = Some(status_info);
+        if let Ok(network_info) = self.get_network_info(network_info) {
+            if let Some(v) = network_info
+                .write()
+                .clients
+                .get_mut(&client_status_info.source)
+            {
+                v.client_status = Some(status_info);
+            }
         }
     }
     async fn wg_ipv4<B: AsRef<[u8]>>(
         &self,
-        context: &LinkVntContext,
+        context: &SessionNetworkInfo,
         net_packet: NetPacket<B>,
     ) -> anyhow::Result<()> {
         let source = net_packet.source();
@@ -573,9 +587,10 @@ impl ServerPacketHandler {
         if destination == context.virtual_ip {
             return Ok(());
         }
+        let network_info = self.get_network_info(context)?;
         if dest.is_broadcast() || dest == context.broadcast {
             // 广播
-            for peer in context.network_info.read().clients.values() {
+            for peer in network_info.read().clients.values() {
                 if !peer.online || destination == peer.virtual_ip {
                     continue;
                 }
@@ -585,7 +600,7 @@ impl ServerPacketHandler {
                     }
                 }
             }
-        } else if let Some(peer) = context.network_info.read().clients.get(&destination) {
+        } else if let Some(peer) = network_info.read().clients.get(&destination) {
             // 点对点
             if peer.online {
                 if let Some(sender) = &peer.wg_sender {
@@ -599,13 +614,17 @@ impl ServerPacketHandler {
     }
     fn broadcast<B: AsRef<[u8]>>(
         &self,
-        context: &LinkVntContext,
+        context: &SessionNetworkInfo,
         net_packet: NetPacket<B>,
         exclude: &[Ipv4Addr],
     ) -> io::Result<()> {
+        let network_info = self
+            .controller
+            .get_network_info(&context.group)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "virtual_network is none"))?;
         let client_secret = net_packet.is_encrypt();
         let destination = u32::from(net_packet.destination());
-        for (ip, client_info) in &context.network_info.read().clients {
+        for (ip, client_info) in &network_info.read().clients {
             if client_info.online
                 && destination != *ip
                 && client_info.client_secret == client_secret
@@ -664,7 +683,7 @@ pub struct RegisterClientResponse {
 }
 
 pub async fn generate_ip(
-    cache: &Controller,
+    controller: &Controller,
     register_request: RegisterClientRequest,
 ) -> anyhow::Result<RegisterClientResponse> {
     let gateway: u32 = register_request.gateway.into();
@@ -674,9 +693,8 @@ pub async fn generate_ip(
     let device_id = register_request.device_id;
     let allow_ip_change = register_request.allow_ip_change;
     let group_id = register_request.group_id;
-    let v = cache
-        .virtual_network
-        .optionally_get_with(group_id, || {
+    let v = controller
+        .get_or_create_network_info(group_id, || {
             (
                 Duration::from_secs(7 * 24 * 3600),
                 Arc::new(parking_lot::const_rwlock(NetworkInfo::new(

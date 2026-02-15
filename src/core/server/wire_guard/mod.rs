@@ -48,8 +48,7 @@ impl WireGuardGroup {
         let config = self.handshake(&buf)?;
         let network_info = self
             .cache
-            .virtual_network
-            .get(&config.group_id)
+            .get_network_info(&config.group_id)
             .context("wg配置已过期")?;
         let (network_receiver, broadcast_ip, mask_ip, gateway_ip) = {
             let mut guard = network_info.write();
@@ -119,10 +118,8 @@ impl WireGuardGroup {
                 .map_err(|e| anyhow!("HandshakeInit {:?}", e))?;
                 let config = self
                     .cache
-                    .wg_group_map
-                    .get(&half_handshake.peer_static_public)
-                    .context("需要先在vnts配置wg信息")?
-                    .clone();
+                    .get_wg_group(&half_handshake.peer_static_public)
+                    .context("需要先在vnts配置wg信息")?;
                 Ok(config)
             }
             _ => Err(anyhow!("非握手包")),
@@ -197,7 +194,7 @@ impl WireGuard {
         self.offline();
     }
     fn offline(&self) {
-        if let Some(v) = self.cache.virtual_network.get(&self.group_id) {
+        if let Some(v) = self.cache.get_network_info(&self.group_id) {
             if let Some(v) = v.write().clients.get_mut(&self.ip.into()) {
                 if v.address == self.wg_source_addr {
                     v.online = false;
@@ -439,8 +436,7 @@ impl WireGuard {
         if server_secret {
             let cipher = self
                 .cache
-                .cipher_session
-                .get(&peer_addr)
+                .get_cipher_session(&peer_addr)
                 .context("加密信息不存在")?;
             cipher.encrypt_ipv4(&mut net_packet)?;
         }

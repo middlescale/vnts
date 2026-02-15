@@ -1,6 +1,6 @@
+use crate::core::control::controller::VntSession;
 use crate::core::server::wire_guard::WireGuardGroup;
 use crate::core::service::PacketHandler;
-use crate::core::control::controller::VntContext;
 use crate::protocol::NetPacket;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -68,11 +68,7 @@ impl UdpGroup {
         let handler = self.handler.clone();
         let udp = self.udp.clone();
         tokio::spawn(async move {
-            let mut context = VntContext {
-                link_context: None,
-                server_cipher: None,
-                link_address: addr,
-            };
+            let mut session = VntSession::new(addr);
             loop {
                 let data = match tokio::time::timeout(Duration::from_secs(60), udp_receiver.recv())
                     .await
@@ -83,8 +79,7 @@ impl UdpGroup {
                 if let Some(data) = data {
                     match NetPacket::new(data) {
                         Ok(net_packet) => {
-                            if let Some(rs) =
-                                handler.handle(&mut context, net_packet, addr, &None).await
+                            if let Some(rs) = handler.handle(&mut session, net_packet, &None).await
                             {
                                 if let Err(e) = udp.send_to(rs.buffer(), addr).await {
                                     log::error!("{:?} {}", e, addr)
@@ -99,7 +94,7 @@ impl UdpGroup {
                     break;
                 }
             }
-            handler.leave(context).await;
+            handler.leave(session).await;
             data_channel_map.lock().remove(&addr);
         });
         Ok(())

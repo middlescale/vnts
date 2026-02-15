@@ -1,5 +1,5 @@
+use crate::core::control::controller::VntSession;
 use crate::core::service::PacketHandler;
-use crate::core::control::controller::VntContext;
 use crate::protocol::NetPacket;
 use anyhow::Context;
 use futures_util::{SinkExt, StreamExt};
@@ -15,11 +15,7 @@ pub async fn handle_websocket_connection(
     handler: PacketHandler,
 ) {
     tokio::spawn(async move {
-        let mut context = VntContext {
-            link_context: None,
-            server_cipher: None,
-            link_address: addr,
-        };
+        let mut context = VntSession::new(addr);
         if let Err(e) = handle_websocket_connection0(&mut context, stream, addr, &handler).await {
             log::warn!("websocket err {:?} {}", e, addr);
         }
@@ -28,7 +24,7 @@ pub async fn handle_websocket_connection(
 }
 
 async fn handle_websocket_connection0(
-    context: &mut VntContext,
+    context: &mut VntSession,
     stream: TcpStream,
     addr: SocketAddr,
     handler: &PacketHandler,
@@ -57,7 +53,7 @@ async fn handle_websocket_connection0(
             Message::Text(txt) => log::info!("Received text message: {} {}", txt, addr),
             Message::Binary(mut data) => {
                 let packet = NetPacket::new0(data.len(), &mut data)?;
-                if let Some(rs) = handler.handle(context, packet, addr, &sender).await {
+                if let Some(rs) = handler.handle(context, packet, &sender).await {
                     if sender
                         .as_ref()
                         .unwrap()

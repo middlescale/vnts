@@ -49,8 +49,7 @@ impl VntsWebService {
             self.login_time.store((time, 0));
             let auth = uuid::Uuid::new_v4().to_string().replace("-", "");
             self.cache
-                .auth_map
-                .insert(auth.clone(), (), Duration::from_secs(3600 * 24))
+                .insert_auth(auth.clone(), Duration::from_secs(3600 * 24))
                 .await;
             Ok(auth)
         } else {
@@ -59,13 +58,12 @@ impl VntsWebService {
         }
     }
     pub fn check_auth(&self, auth: &String) -> bool {
-        self.cache.auth_map.get(auth).is_some()
+        self.cache.contains_auth(auth)
     }
     pub fn group_list(&self) -> GroupList {
         let group_list: Vec<String> = self
             .cache
-            .virtual_network
-            .key_values()
+            .network_groups()
             .into_iter()
             .map(|(key, _)| key)
             .collect();
@@ -73,18 +71,18 @@ impl VntsWebService {
     }
     pub fn remove_client(&self, req: RemoveClientReq) {
         if let Some(ip) = req.virtual_ip {
-            if let Some(network_info) = self.cache.virtual_network.get(&req.group_id) {
+            if let Some(network_info) = self.cache.get_network_info(&req.group_id) {
                 if let Some(client_info) = network_info.write().clients.remove(&ip.into()) {
                     if let Some(key) = client_info.wireguard {
-                        self.cache.wg_group_map.remove(&key);
+                        self.cache.remove_wg_group(&key);
                     }
                 }
             }
         } else {
-            if let Some(network_info) = self.cache.virtual_network.remove(&req.group_id) {
+            if let Some(network_info) = self.cache.remove_network_info(&req.group_id) {
                 for (_, client_info) in network_info.write().clients.drain() {
                     if let Some(key) = client_info.wireguard {
-                        self.cache.wg_group_map.remove(&key);
+                        self.cache.remove_wg_group(&key);
                     }
                 }
             }
@@ -144,7 +142,7 @@ impl VntsWebService {
             secret_key,
             public_key,
         };
-        cache.wg_group_map.insert(public_key, wireguard_config);
+        cache.insert_wg_group(public_key, wireguard_config);
         let config = WgConfig {
             vnts_endpoint: wg_data.config.vnts_endpoint,
             vnts_public_key: general_purpose::STANDARD.encode(&self.config.wg_public_key),
@@ -186,7 +184,7 @@ impl VntsWebService {
         Ok((private_key, public_key))
     }
     pub fn group_info(&self, group: String) -> Option<NetworkInfo> {
-        if let Some(info) = self.cache.virtual_network.get(&group) {
+        if let Some(info) = self.cache.get_network_info(&group) {
             let guard = info.read();
             let mut network = NetworkInfo::new(
                 guard.network_ip.into(),
@@ -221,8 +219,8 @@ impl VntsWebService {
                 };
                 let mut wg_config = None;
                 if let Some(key) = &info.wireguard {
-                    if let Some(v) = self.cache.wg_group_map.get(key) {
-                        wg_config.replace(v.clone());
+                    if let Some(v) = self.cache.get_wg_group(key) {
+                        wg_config.replace(v);
                     }
                 }
                 let client_info = ClientInfo {
