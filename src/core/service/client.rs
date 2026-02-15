@@ -13,7 +13,7 @@ use tokio::sync::mpsc::Sender;
 
 #[derive(Clone)]
 pub struct ClientPacketHandler {
-    controller: Controller,
+    controller: Arc<Controller>,
     config: ConfigInfo,
     rsa_cipher: Option<RsaCipher>,
     udp: Arc<UdpSocket>,
@@ -21,7 +21,7 @@ pub struct ClientPacketHandler {
 
 impl ClientPacketHandler {
     pub fn new(
-        controller: Controller,
+        controller: Arc<Controller>,
         config: ConfigInfo,
         rsa_cipher: Option<RsaCipher>,
         udp: Arc<UdpSocket>,

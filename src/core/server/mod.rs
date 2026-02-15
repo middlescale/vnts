@@ -24,7 +24,7 @@ pub async fn start(
     rsa_cipher: Option<RsaCipher>,
 ) -> io::Result<()> {
     let udp = Arc::new(UdpSocket::from_std(udp)?);
-    let controller = Controller::new();
+    let controller = Arc::new(Controller::new());
     let handler = PacketHandler::new(
         controller.clone(),
         config.clone(),

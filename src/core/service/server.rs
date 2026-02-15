@@ -25,7 +25,7 @@ use crate::{protocol, ConfigInfo};
 
 #[derive(Clone)]
 pub struct ServerPacketHandler {
-    controller: Controller,
+    controller: Arc<Controller>,
     config: ConfigInfo,
     rsa_cipher: Option<RsaCipher>,
     udp: Arc<UdpSocket>,
@@ -33,7 +33,7 @@ pub struct ServerPacketHandler {
 
 impl ServerPacketHandler {
     pub fn new(
-        controller: Controller,
+        controller: Arc<Controller>,
         config: ConfigInfo,
         rsa_cipher: Option<RsaCipher>,
         udp: Arc<UdpSocket>,
@@ -683,7 +683,7 @@ pub struct RegisterClientResponse {
 }
 
 pub async fn generate_ip(
-    controller: &Controller,
+    controller: &Arc<Controller>,
     register_request: RegisterClientRequest,
 ) -> anyhow::Result<RegisterClientResponse> {
     let gateway: u32 = register_request.gateway.into();

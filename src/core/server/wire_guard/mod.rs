@@ -20,14 +20,14 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 pub struct WireGuardGroup {
-    cache: Controller,
+    cache: Arc<Controller>,
     config: ConfigInfo,
     udp: Arc<UdpSocket>,
     data_channel_map: Arc<Mutex<HashMap<SocketAddr, Sender<Vec<u8>>>>>,
 }
 
 impl WireGuardGroup {
-    pub fn new(cache: Controller, config: ConfigInfo, udp: Arc<UdpSocket>) -> Self {
+    pub fn new(cache: Arc<Controller>, config: ConfigInfo, udp: Arc<UdpSocket>) -> Self {
         Self {
             cache,
             config,
@@ -136,7 +136,7 @@ pub struct WireGuard {
 
     group_id: String,
     tunn: Tunn,
-    cache: Controller,
+    cache: Arc<Controller>,
     wg_source_addr: SocketAddr,
     udp: Arc<UdpSocket>,
     data_channel_map: Arc<Mutex<HashMap<SocketAddr, Sender<Vec<u8>>>>>,
@@ -148,7 +148,7 @@ impl WireGuard {
         broadcast_ip: Ipv4Addr,
         mask_ip: Ipv4Addr,
         gateway_ip: Ipv4Addr,
-        cache: Controller,
+        cache: Arc<Controller>,
         vnts_secret_key: StaticSecret,
         udp: Arc<UdpSocket>,
         wg_source_addr: SocketAddr,

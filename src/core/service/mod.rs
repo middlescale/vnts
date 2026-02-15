@@ -27,7 +27,7 @@ struct PacketDispatcher {
 
 impl PacketDispatcher {
     pub fn new(
-        controller: Controller,
+        controller: Arc<Controller>,
         config: ConfigInfo,
         rsa_cipher: Option<RsaCipher>,
         udp: Arc<UdpSocket>,
@@ -62,7 +62,7 @@ impl PacketDispatcher {
 
 impl PacketHandler {
     pub fn new(
-        controller: Controller,
+        controller: Arc<Controller>,
         config: ConfigInfo,
         rsa_cipher: Option<RsaCipher>,
         udp: Arc<UdpSocket>,

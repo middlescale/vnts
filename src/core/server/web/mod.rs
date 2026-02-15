@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net;
+use std::sync::Arc;
 
 use actix_web::dev::Service;
 use actix_web::web::Data;
@@ -73,7 +74,7 @@ async fn group_info(
 
 pub async fn start(
     lst: net::TcpListener,
-    cache: Controller,
+    cache: Arc<Controller>,
     config: ConfigInfo,
 ) -> std::io::Result<()> {
     let web_service = VntsWebService::new(cache, config);

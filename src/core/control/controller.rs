@@ -76,7 +76,6 @@ impl VntSession {
     }
 }
 
-#[derive(Clone)]
 pub struct Controller {
     // group -> NetworkInfo
     virtual_network: ExpireMap<String, Arc<RwLock<NetworkInfo>>>,

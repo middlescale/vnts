@@ -22,13 +22,13 @@ use crate::ConfigInfo;
 
 #[derive(Clone)]
 pub struct VntsWebService {
-    cache: Controller,
+    cache: Arc<Controller>,
     config: ConfigInfo,
     login_time: Arc<AtomicCell<(Instant, usize)>>,
 }
 
 impl VntsWebService {
-    pub fn new(cache: Controller, config: ConfigInfo) -> Self {
+    pub fn new(cache: Arc<Controller>, config: ConfigInfo) -> Self {
         Self {
             cache,
             config,
