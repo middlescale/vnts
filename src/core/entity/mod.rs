@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 
 use chrono::{DateTime, Local};
-use tokio::sync::mpsc::Sender;
 
 #[derive(Clone, Debug)]
 pub struct WireGuardConfig {
@@ -66,11 +65,8 @@ pub struct ClientInfo {
     pub online: bool,
     // 分配的ip
     pub virtual_ip: u32,
-    // 建立的tcp连接发送端
-    pub tcp_sender: Option<Sender<Vec<u8>>>,
     // wireguard客户端公钥
     pub wireguard: Option<[u8; 32]>,
-    pub wg_sender: Option<Sender<(Vec<u8>, Ipv4Addr)>>,
     pub client_status: Option<ClientStatusInfo>,
     pub last_join_time: DateTime<Local>,
     pub timestamp: i64,
@@ -125,9 +121,7 @@ impl Default for ClientInfo {
             address: "0.0.0.0:0".parse().unwrap(),
             online: false,
             virtual_ip: 0,
-            tcp_sender: None,
             wireguard: None,
-            wg_sender: None,
             client_status: None,
             last_join_time: Local::now(),
             timestamp: 0,

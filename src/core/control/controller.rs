@@ -3,6 +3,7 @@ use parking_lot::RwLock;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc::Sender;
 
 use crate::cipher::Aes256GcmCipher;
 use crate::core::control::expire_map::ExpireMap;
@@ -60,7 +61,11 @@ impl VntSession {
                             return;
                         }
                         client_info.online = false;
-                        client_info.tcp_sender = None;
+                        controller.set_tcp_sender(
+                            &network_context.group,
+                            network_context.virtual_ip,
+                            None,
+                        );
                         guard.epoch += 1;
                     }
                     drop(guard);
@@ -87,6 +92,14 @@ pub struct Controller {
     auth_map: ExpireMap<String, ()>,
     // wg公钥 -> wg配置
     wg_group_map: Arc<DashMap<[u8; 32], WireGuardConfig>>,
+    // (group, virtual_ip) -> runtime sender info
+    client_runtime: Arc<DashMap<(String, u32), ClientRuntime>>,
+}
+
+#[derive(Clone, Default)]
+pub struct ClientRuntime {
+    pub tcp_sender: Option<Sender<Vec<u8>>>,
+    pub wg_sender: Option<Sender<(Vec<u8>, Ipv4Addr)>>,
 }
 
 impl Controller {
@@ -131,6 +144,7 @@ impl Controller {
             cipher_session: Default::default(),
             auth_map,
             wg_group_map,
+            client_runtime: Default::default(),
         }
     }
 }
@@ -140,7 +154,12 @@ impl Controller {
         self.virtual_network.get(&group.to_string())
     }
     pub fn remove_network_info(&self, group: &str) -> Option<Arc<RwLock<NetworkInfo>>> {
-        self.virtual_network.remove(&group.to_string())
+        let removed = self.virtual_network.remove(&group.to_string());
+        if removed.is_some() {
+            self.client_runtime
+                .retain(|(group_id, _), _| group_id.as_str() != group);
+        }
+        removed
     }
     pub fn network_groups(&self) -> Vec<(String, Arc<RwLock<NetworkInfo>>)> {
         self.virtual_network.key_values()
@@ -197,5 +216,53 @@ impl Controller {
         self.ip_session
             .insert(key, value, Duration::from_secs(24 * 3600))
             .await
+    }
+    pub fn set_tcp_sender(
+        &self,
+        group: &str,
+        virtual_ip: u32,
+        tcp_sender: Option<Sender<Vec<u8>>>,
+    ) {
+        self.set_client_runtime(group, virtual_ip, |runtime| runtime.tcp_sender = tcp_sender);
+    }
+    pub fn get_tcp_sender(&self, group: &str, virtual_ip: u32) -> Option<Sender<Vec<u8>>> {
+        self.client_runtime
+            .get(&(group.to_string(), virtual_ip))
+            .and_then(|runtime| runtime.tcp_sender.clone())
+    }
+    pub fn set_wg_sender(
+        &self,
+        group: &str,
+        virtual_ip: u32,
+        wg_sender: Option<Sender<(Vec<u8>, Ipv4Addr)>>,
+    ) {
+        self.set_client_runtime(group, virtual_ip, |runtime| runtime.wg_sender = wg_sender);
+    }
+    pub fn get_wg_sender(
+        &self,
+        group: &str,
+        virtual_ip: u32,
+    ) -> Option<Sender<(Vec<u8>, Ipv4Addr)>> {
+        self.client_runtime
+            .get(&(group.to_string(), virtual_ip))
+            .and_then(|runtime| runtime.wg_sender.clone())
+    }
+
+    fn set_client_runtime<F>(&self, group: &str, virtual_ip: u32, f: F)
+    where
+        F: FnOnce(&mut ClientRuntime),
+    {
+        let key = (group.to_string(), virtual_ip);
+        let mut runtime = self
+            .client_runtime
+            .get(&key)
+            .map(|v| v.value().clone())
+            .unwrap_or_default();
+        f(&mut runtime);
+        if runtime.tcp_sender.is_none() && runtime.wg_sender.is_none() {
+            self.client_runtime.remove(&key);
+        } else {
+            self.client_runtime.insert(key, runtime);
+        }
     }
 }

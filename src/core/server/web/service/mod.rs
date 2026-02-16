@@ -73,6 +73,8 @@ impl VntsWebService {
         if let Some(ip) = req.virtual_ip {
             if let Some(network_info) = self.cache.get_network_info(&req.group_id) {
                 if let Some(client_info) = network_info.write().clients.remove(&ip.into()) {
+                    self.cache.set_tcp_sender(&req.group_id, u32::from(ip), None);
+                    self.cache.set_wg_sender(&req.group_id, u32::from(ip), None);
                     if let Some(key) = client_info.wireguard {
                         self.cache.remove_wg_group(&key);
                     }

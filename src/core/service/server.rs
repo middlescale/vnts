@@ -594,7 +594,7 @@ impl ServerPacketHandler {
                 if !peer.online || destination == peer.virtual_ip {
                     continue;
                 }
-                if let Some(sender) = &peer.wg_sender {
+                if let Some(sender) = self.controller.get_wg_sender(&context.group, peer.virtual_ip) {
                     if let Err(e) = sender.try_send((net_packet.payload().to_vec(), source)) {
                         log::info!("广播到对端wg失败 {}->{},{}", source, dest, e);
                     }
@@ -603,7 +603,7 @@ impl ServerPacketHandler {
         } else if let Some(peer) = network_info.read().clients.get(&destination) {
             // 点对点
             if peer.online {
-                if let Some(sender) = &peer.wg_sender {
+                if let Some(sender) = self.controller.get_wg_sender(&context.group, destination) {
                     if let Err(e) = sender.try_send((net_packet.payload().to_vec(), source)) {
                         log::info!("发送到对端wg失败 {}->{},{}", source, dest, e);
                     }
@@ -631,7 +631,7 @@ impl ServerPacketHandler {
                 && client_info.wireguard.is_none()
                 && !exclude.contains(&(*ip).into())
             {
-                if let Some(sender) = &client_info.tcp_sender {
+                if let Some(sender) = self.controller.get_tcp_sender(&context.group, *ip) {
                     let _ = sender.try_send(net_packet.buffer().to_vec());
                 } else {
                     let _ = self
@@ -692,7 +692,9 @@ pub async fn generate_ip(
     let mut virtual_ip: u32 = register_request.virtual_ip.into();
     let device_id = register_request.device_id;
     let allow_ip_change = register_request.allow_ip_change;
+    let runtime_group_id = register_request.group_id.clone();
     let group_id = register_request.group_id;
+    let tcp_sender = register_request.tcp_sender.clone();
     let v = controller
         .get_or_create_network_info(group_id, || {
             (
@@ -777,10 +779,15 @@ pub async fn generate_ip(
     info.online = register_request.online;
     info.wireguard = register_request.wireguard;
     info.virtual_ip = virtual_ip;
-    info.tcp_sender = register_request.tcp_sender;
     info.last_join_time = Local::now();
     info.timestamp = timestamp;
     lock.epoch += 1;
+    if old_ip != 0 && old_ip != virtual_ip {
+        controller.set_tcp_sender(&runtime_group_id, old_ip, None);
+        controller.set_wg_sender(&runtime_group_id, old_ip, None);
+    }
+    controller.set_tcp_sender(&runtime_group_id, virtual_ip, tcp_sender);
+    controller.set_wg_sender(&runtime_group_id, virtual_ip, None);
     let response = RegisterClientResponse {
         timestamp,
         virtual_ip: virtual_ip.into(),

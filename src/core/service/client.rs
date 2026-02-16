@@ -82,7 +82,12 @@ impl ClientPacketHandler {
                             && v.client_secret == is_encrypt
                             && v.virtual_ip != source_ip
                     })
-                    .map(|v| (v.address, v.tcp_sender.clone()));
+                    .map(|v| {
+                        (
+                            v.address,
+                            self.controller.get_tcp_sender(&network_info.group, v.virtual_ip),
+                        )
+                    });
                 if let Some((peer_addr, peer_tcp_sender)) = rs {
                     send_one(&self.udp, peer_addr, peer_tcp_sender, &net_packet).await;
                 }
@@ -111,7 +116,12 @@ impl ClientPacketHandler {
                     && v.client_secret == is_encrypt
                     && v.virtual_ip != source_ip
             })
-            .map(|v| (v.address, v.tcp_sender.clone()))
+            .map(|v| {
+                (
+                    v.address,
+                    self.controller.get_tcp_sender(&network_info.group, v.virtual_ip),
+                )
+            })
             .collect();
         for (peer_addr, peer_tcp_sender) in list {
             send_one(&self.udp, peer_addr, peer_tcp_sender, &net_packet).await;

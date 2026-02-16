@@ -1,5 +1,5 @@
-use crate::core::entity::{NetworkInfo, WireGuardConfig};
 use crate::core::control::controller::Controller;
+use crate::core::entity::{NetworkInfo, WireGuardConfig};
 use crate::protocol::{ip_turn_packet, NetPacket, Protocol, HEAD_LEN, MAX_TTL};
 use crate::ConfigInfo;
 use anyhow::{anyhow, Context};
@@ -62,7 +62,8 @@ impl WireGuardGroup {
                 Err(anyhow!("不是wg配置"))?;
             }
             let (network_sender, network_receiver) = channel(64);
-            client_info.wg_sender = Some(network_sender);
+            self.cache
+                .set_wg_sender(&config.group_id, u32::from(config.ip), Some(network_sender));
             client_info.last_join_time = Local::now();
             client_info.timestamp = client_info.last_join_time.timestamp();
             client_info.address = addr;
@@ -136,7 +137,7 @@ pub struct WireGuard {
 
     group_id: String,
     tunn: Tunn,
-    cache: Arc<Controller>,
+    controller: Arc<Controller>,
     wg_source_addr: SocketAddr,
     udp: Arc<UdpSocket>,
     data_channel_map: Arc<Mutex<HashMap<SocketAddr, Sender<Vec<u8>>>>>,
@@ -148,7 +149,7 @@ impl WireGuard {
         broadcast_ip: Ipv4Addr,
         mask_ip: Ipv4Addr,
         gateway_ip: Ipv4Addr,
-        cache: Arc<Controller>,
+        controller: Arc<Controller>,
         vnts_secret_key: StaticSecret,
         udp: Arc<UdpSocket>,
         wg_source_addr: SocketAddr,
@@ -171,7 +172,7 @@ impl WireGuard {
             gateway_ip,
             group_id: config.group_id,
             tunn,
-            cache,
+            controller,
             wg_source_addr,
             udp,
             data_channel_map,
@@ -194,11 +195,12 @@ impl WireGuard {
         self.offline();
     }
     fn offline(&self) {
-        if let Some(v) = self.cache.get_network_info(&self.group_id) {
+        if let Some(v) = self.controller.get_network_info(&self.group_id) {
             if let Some(v) = v.write().clients.get_mut(&self.ip.into()) {
                 if v.address == self.wg_source_addr {
                     v.online = false;
-                    v.wg_sender = None;
+                    self.controller
+                        .set_wg_sender(&self.group_id, u32::from(self.ip), None);
                 }
             }
         }
@@ -345,9 +347,9 @@ impl WireGuard {
                 .map(|v| {
                     (
                         v.address,
-                        v.tcp_sender.clone(),
+                        self.controller.get_tcp_sender(&self.group_id, v.virtual_ip),
                         v.server_secret,
-                        v.wg_sender.clone(),
+                        self.controller.get_wg_sender(&self.group_id, v.virtual_ip),
                     )
                 })
                 .collect();
@@ -385,8 +387,10 @@ impl WireGuard {
                 (
                     server_secret,
                     dest_link_addr,
-                    dest_client_info.tcp_sender.clone(),
-                    dest_client_info.wg_sender.clone(),
+                    self.controller
+                        .get_tcp_sender(&self.group_id, dest_client_info.virtual_ip),
+                    self.controller
+                        .get_wg_sender(&self.group_id, dest_client_info.virtual_ip),
                 )
             } else {
                 Err(anyhow!("目标未注册"))?
@@ -435,7 +439,7 @@ impl WireGuard {
         net_packet.set_payload(data)?;
         if server_secret {
             let cipher = self
-                .cache
+                .controller
                 .get_cipher_session(&peer_addr)
                 .context("加密信息不存在")?;
             cipher.encrypt_ipv4(&mut net_packet)?;
