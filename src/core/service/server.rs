@@ -429,7 +429,7 @@ impl ServerPacketHandler {
             .into_iter()
             .map(|v| v.into())
             .collect();
-        session.set_network_info(SessionNetworkInfo {
+        session.enter_network(SessionNetworkInfo {
             group: group_id.clone(),
             virtual_ip,
             broadcast: config.broadcast,
@@ -509,10 +509,7 @@ impl ServerPacketHandler {
             packet.set_transport_protocol(service_packet::Protocol::SecretHandshakeResponse.into());
             self.common_param(&mut packet, source);
             c.encrypt_ipv4(&mut packet)?;
-            session.set_server_cipher(c.clone());
-            self.controller
-                .insert_cipher_session(*session.address(), c)
-                .await;
+            session.enter_cipher(&self.controller, c).await;
             return Ok(packet);
         }
         Err(anyhow!("no encryption"))

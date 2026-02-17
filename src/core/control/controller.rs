@@ -37,14 +37,17 @@ impl VntSession {
     pub fn network_info(&self) -> Option<&SessionNetworkInfo> {
         self.network_info.as_ref()
     }
-    pub fn set_network_info(&mut self, network_info: SessionNetworkInfo) {
+    pub fn enter_network(&mut self, network_info: SessionNetworkInfo) {
         self.network_info.replace(network_info);
     }
     pub fn server_cipher(&self) -> Option<&Aes256GcmCipher> {
         self.server_cipher.as_ref()
     }
-    pub fn set_server_cipher(&mut self, server_cipher: Aes256GcmCipher) {
-        self.server_cipher.replace(server_cipher);
+    pub async fn enter_cipher(&mut self, controller: &Controller, server_cipher: Aes256GcmCipher) {
+        self.server_cipher.replace(server_cipher.clone());
+        controller
+            .insert_cipher_session(self.address, server_cipher)
+            .await;
     }
     pub async fn leave(self, controller: &Controller) {
         if self.server_cipher.is_some() {
