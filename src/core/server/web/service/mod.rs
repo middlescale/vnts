@@ -61,28 +61,32 @@ impl VntsWebService {
         self.cache.contains_auth(auth)
     }
     pub fn group_list(&self) -> GroupList {
-        let group_list: Vec<String> = self
-            .cache
-            .network_groups()
-            .into_iter()
-            .map(|(key, _)| key)
-            .collect();
+        let group_list: Vec<String> = self.cache.group_ids();
         GroupList { group_list }
     }
     pub fn remove_client(&self, req: RemoveClientReq) {
         if let Some(ip) = req.virtual_ip {
-            if let Some(network_info) = self.cache.get_network_info(&req.group_id) {
-                if let Some(client_info) = network_info.write().clients.remove(&ip.into()) {
-                    self.cache.set_tcp_sender(&req.group_id, u32::from(ip), None);
-                    self.cache.set_wg_sender(&req.group_id, u32::from(ip), None);
-                    if let Some(key) = client_info.wireguard {
-                        self.cache.remove_wg_group(&key);
-                    }
+            if let Some(client_info) = self
+                .cache
+                .with_network_write(&req.group_id, |network_info| {
+                    network_info.clients.remove(&ip.into())
+                })
+                .flatten()
+            {
+                self.cache.set_tcp_sender(&req.group_id, u32::from(ip), None);
+                self.cache.set_wg_sender(&req.group_id, u32::from(ip), None);
+                if let Some(key) = client_info.wireguard {
+                    self.cache.remove_wg_group(&key);
                 }
             }
         } else {
-            if let Some(network_info) = self.cache.remove_network_info(&req.group_id) {
-                for (_, client_info) in network_info.write().clients.drain() {
+            if let Some(clients) = self
+                .cache
+                .remove_network(&req.group_id, |network_info| {
+                    network_info.clients.drain().map(|(_, c)| c).collect::<Vec<_>>()
+                })
+            {
+                for client_info in clients {
                     if let Some(key) = client_info.wireguard {
                         self.cache.remove_wg_group(&key);
                     }
@@ -186,8 +190,7 @@ impl VntsWebService {
         Ok((private_key, public_key))
     }
     pub fn group_info(&self, group: String) -> Option<NetworkInfo> {
-        if let Some(info) = self.cache.get_network_info(&group) {
-            let guard = info.read();
+        self.cache.with_network_read(&group, |guard| {
             let mut network = NetworkInfo::new(
                 guard.network_ip.into(),
                 guard.mask_ip.into(),
@@ -243,9 +246,7 @@ impl VntsWebService {
             network
                 .clients
                 .sort_by(|v1, v2| v1.virtual_ip.cmp(&v2.virtual_ip));
-            Some(network)
-        } else {
-            None
-        }
+            network
+        })
     }
 }

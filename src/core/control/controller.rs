@@ -51,9 +51,8 @@ impl VntSession {
             controller.remove_cipher_session(&self.address);
         }
         if let Some(network_context) = self.network_info {
-            if let Some(network_info) = controller.get_network_info(&network_context.group) {
-                {
-                    let mut guard = network_info.write();
+            if controller
+                .with_network_write(&network_context.group, |guard| {
                     if let Some(client_info) = guard.clients.get_mut(&network_context.virtual_ip) {
                         if client_info.address != self.address
                             && client_info.timestamp != network_context.timestamp
@@ -68,8 +67,9 @@ impl VntSession {
                         );
                         guard.epoch += 1;
                     }
-                    drop(guard);
-                }
+                })
+                .is_some()
+            {
                 controller
                     .insert_ip_session(
                         (network_context.group, network_context.virtual_ip),
@@ -150,43 +150,74 @@ impl Controller {
 }
 
 impl Controller {
-    pub fn get_network_info(&self, group: &str) -> Option<Arc<RwLock<NetworkInfo>>> {
-        self.virtual_network.get(&group.to_string())
+    pub fn with_network_read<T, F>(&self, group: &str, f: F) -> Option<T>
+    where
+        F: FnOnce(&NetworkInfo) -> T,
+    {
+        self.virtual_network.get(&group.to_string()).map(|network_info| {
+            let guard = network_info.read();
+            f(&guard)
+        })
     }
-    pub fn remove_network_info(&self, group: &str) -> Option<Arc<RwLock<NetworkInfo>>> {
+    pub fn with_network_write<T, F>(&self, group: &str, f: F) -> Option<T>
+    where
+        F: FnOnce(&mut NetworkInfo) -> T,
+    {
+        self.virtual_network.get(&group.to_string()).map(|network_info| {
+            let mut guard = network_info.write();
+            f(&mut guard)
+        })
+    }
+    pub fn remove_network<T, F>(&self, group: &str, f: F) -> Option<T>
+    where
+        F: FnOnce(&mut NetworkInfo) -> T,
+    {
         let removed = self.virtual_network.remove(&group.to_string());
-        if removed.is_some() {
+        if let Some(network_info) = removed {
             self.client_runtime
                 .retain(|(group_id, _), _| group_id.as_str() != group);
+            let mut guard = network_info.write();
+            Some(f(&mut guard))
+        } else {
+            None
         }
-        removed
     }
-    pub fn network_groups(&self) -> Vec<(String, Arc<RwLock<NetworkInfo>>)> {
-        self.virtual_network.key_values()
+    pub fn group_ids(&self) -> Vec<String> {
+        self.virtual_network
+            .key_values()
+            .into_iter()
+            .map(|(group, _)| group)
+            .collect()
     }
     pub fn all_client_info(&self) -> Vec<(String, Vec<SimpleClientInfo>)> {
-        self.network_groups()
+        self.virtual_network
+            .key_values()
             .into_iter()
             .map(|(group, network_info)| {
-                let clients = network_info
-                    .read()
-                    .clients
-                    .values()
-                    .map(SimpleClientInfo::from)
-                    .collect();
+                let clients = network_info.read().clients.values().map(SimpleClientInfo::from).collect();
                 (group, clients)
             })
             .collect()
     }
-    pub async fn get_or_create_network_info<F>(
+    pub async fn with_or_create_network_write<T, C, F>(
         &self,
         group: String,
+        create: C,
         f: F,
-    ) -> Arc<RwLock<NetworkInfo>>
+    ) -> T
     where
-        F: FnOnce() -> (Duration, Arc<RwLock<NetworkInfo>>),
+        C: FnOnce() -> (Duration, NetworkInfo),
+        F: FnOnce(&mut NetworkInfo) -> T,
     {
-        self.virtual_network.optionally_get_with(group, f).await
+        let network_info = self
+            .virtual_network
+            .optionally_get_with(group, || {
+                let (duration, network_info) = create();
+                (duration, Arc::new(parking_lot::RwLock::new(network_info)))
+            })
+            .await;
+        let mut guard = network_info.write();
+        f(&mut guard)
     }
     pub async fn insert_auth(&self, auth: String, expire: Duration) {
         self.auth_map.insert(auth, (), expire).await;

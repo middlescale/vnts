@@ -1,5 +1,5 @@
 use crate::core::control::controller::Controller;
-use crate::core::entity::{NetworkInfo, WireGuardConfig};
+use crate::core::entity::WireGuardConfig;
 use crate::protocol::{ip_turn_packet, NetPacket, Protocol, HEAD_LEN, MAX_TTL};
 use crate::ConfigInfo;
 use anyhow::{anyhow, Context};
@@ -10,7 +10,7 @@ use chrono::Local;
 use packet::icmp::{icmp, Kind};
 use packet::ip::ipv4;
 use packet::ip::ipv4::packet::IpV4Packet;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use rand::RngCore;
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -20,7 +20,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 pub struct WireGuardGroup {
-    cache: Arc<Controller>,
+    controller: Arc<Controller>,
     config: ConfigInfo,
     udp: Arc<UdpSocket>,
     data_channel_map: Arc<Mutex<HashMap<SocketAddr, Sender<Vec<u8>>>>>,
@@ -29,7 +29,7 @@ pub struct WireGuardGroup {
 impl WireGuardGroup {
     pub fn new(cache: Arc<Controller>, config: ConfigInfo, udp: Arc<UdpSocket>) -> Self {
         Self {
-            cache,
+            controller: cache,
             config,
             udp,
             data_channel_map: Default::default(),
@@ -46,42 +46,45 @@ impl WireGuardGroup {
             return Ok(());
         }
         let config = self.handshake(&buf)?;
-        let network_info = self
-            .cache
-            .get_network_info(&config.group_id)
-            .context("wg配置已过期")?;
         let (network_receiver, broadcast_ip, mask_ip, gateway_ip) = {
-            let mut guard = network_info.write();
-            let broadcast_ip = guard.network_ip | (!guard.mask_ip);
-
-            let client_info = guard
-                .clients
-                .get_mut(&config.ip.into())
-                .context("wg配置已过期")?;
-            if client_info.wireguard.is_none() {
-                Err(anyhow!("不是wg配置"))?;
-            }
-            let (network_sender, network_receiver) = channel(64);
-            self.cache
-                .set_wg_sender(&config.group_id, u32::from(config.ip), Some(network_sender));
-            client_info.last_join_time = Local::now();
-            client_info.timestamp = client_info.last_join_time.timestamp();
-            client_info.address = addr;
-            client_info.online = true;
-            guard.epoch += 1;
-            (
-                network_receiver,
-                broadcast_ip,
-                guard.mask_ip,
-                guard.gateway_ip,
-            )
+            self.controller
+                .with_network_write(
+                    &config.group_id,
+                    |guard| -> anyhow::Result<(Receiver<(Vec<u8>, Ipv4Addr)>, u32, u32, u32)> {
+                        let broadcast_ip = guard.network_ip | (!guard.mask_ip);
+                        let client_info = guard
+                            .clients
+                            .get_mut(&config.ip.into())
+                            .ok_or_else(|| anyhow!("wg配置已过期"))?;
+                        if client_info.wireguard.is_none() {
+                            Err(anyhow!("不是wg配置"))?;
+                        }
+                        let (network_sender, network_receiver) = channel(64);
+                        self.controller.set_wg_sender(
+                            &config.group_id,
+                            u32::from(config.ip),
+                            Some(network_sender),
+                        );
+                        client_info.last_join_time = Local::now();
+                        client_info.timestamp = client_info.last_join_time.timestamp();
+                        client_info.address = addr;
+                        client_info.online = true;
+                        guard.epoch += 1;
+                        Ok((
+                            network_receiver,
+                            broadcast_ip,
+                            guard.mask_ip,
+                            guard.gateway_ip,
+                        ))
+                    },
+                )
+                .context("wg配置已过期")??
         };
         let wg = WireGuard::new(
-            network_info.clone(),
             broadcast_ip.into(),
             mask_ip.into(),
             gateway_ip.into(),
-            self.cache.clone(),
+            self.controller.clone(),
             self.config.wg_secret_key.clone(),
             self.udp.clone(),
             addr,
@@ -118,7 +121,7 @@ impl WireGuardGroup {
                 )
                 .map_err(|e| anyhow!("HandshakeInit {:?}", e))?;
                 let config = self
-                    .cache
+                    .controller
                     .get_wg_group(&half_handshake.peer_static_public)
                     .context("需要先在vnts配置wg信息")?;
                 Ok(config)
@@ -129,7 +132,6 @@ impl WireGuardGroup {
 }
 
 pub struct WireGuard {
-    network_info: Arc<RwLock<NetworkInfo>>,
     ip: Ipv4Addr,
     broadcast_ip: Ipv4Addr,
     mask_ip: Ipv4Addr,
@@ -145,7 +147,6 @@ pub struct WireGuard {
 
 impl WireGuard {
     pub fn new(
-        network_info: Arc<RwLock<NetworkInfo>>,
         broadcast_ip: Ipv4Addr,
         mask_ip: Ipv4Addr,
         gateway_ip: Ipv4Addr,
@@ -165,7 +166,6 @@ impl WireGuard {
             None,
         );
         Self {
-            network_info,
             ip: config.ip,
             broadcast_ip,
             mask_ip,
@@ -195,15 +195,16 @@ impl WireGuard {
         self.offline();
     }
     fn offline(&self) {
-        if let Some(v) = self.controller.get_network_info(&self.group_id) {
-            if let Some(v) = v.write().clients.get_mut(&self.ip.into()) {
-                if v.address == self.wg_source_addr {
-                    v.online = false;
-                    self.controller
-                        .set_wg_sender(&self.group_id, u32::from(self.ip), None);
+        self.controller
+            .with_network_write(&self.group_id, |network| {
+                if let Some(v) = network.clients.get_mut(&self.ip.into()) {
+                    if v.address == self.wg_source_addr {
+                        v.online = false;
+                        self.controller
+                            .set_wg_sender(&self.group_id, u32::from(self.ip), None);
+                    }
                 }
-            }
-        }
+            });
         self.data_channel_map.lock().remove(&self.wg_source_addr);
     }
     pub async fn start0(
@@ -338,21 +339,24 @@ impl WireGuard {
         }
         if dest_ip.is_broadcast() || dest_ip == self.broadcast_ip {
             // 广播
-            let x: Vec<_> = self
-                .network_info
-                .read()
-                .clients
-                .values()
-                .filter(|v| v.online && v.virtual_ip != u32::from(self.ip))
-                .map(|v| {
-                    (
-                        v.address,
-                        self.controller.get_tcp_sender(&self.group_id, v.virtual_ip),
-                        v.server_secret,
-                        self.controller.get_wg_sender(&self.group_id, v.virtual_ip),
-                    )
+            let x = self
+                .controller
+                .with_network_read(&self.group_id, |network| {
+                    network
+                        .clients
+                        .values()
+                        .filter(|v| v.online && v.virtual_ip != u32::from(self.ip))
+                        .map(|v| {
+                            (
+                                v.address,
+                                self.controller.get_tcp_sender(&self.group_id, v.virtual_ip),
+                                v.server_secret,
+                                self.controller.get_wg_sender(&self.group_id, v.virtual_ip),
+                            )
+                        })
+                        .collect::<Vec<_>>()
                 })
-                .collect();
+                .context("组网已失效")?;
             for (peer_addr, peer_tcp_sender, server_secret, peer_wg_sender) in x {
                 if let Err(e) = self
                     .send_one(
@@ -373,29 +377,31 @@ impl WireGuard {
             return Ok(());
         }
 
-        let (server_secret, peer_addr, peer_tcp_sender, peer_wg_sender) = {
-            let guard = self.network_info.read();
-            if let Some(dest_client_info) = guard.clients.get(&dest_ip.into()) {
-                if !dest_client_info.online {
-                    Err(anyhow!("目标不在线"))?
+        let (server_secret, peer_addr, peer_tcp_sender, peer_wg_sender) = self
+            .controller
+            .with_network_read(&self.group_id, |network| {
+                if let Some(dest_client_info) = network.clients.get(&dest_ip.into()) {
+                    if !dest_client_info.online {
+                        Err(anyhow!("目标不在线"))?
+                    }
+                    if !dest_client_info.virtual_ip == u32::from(self.ip) {
+                        Err(anyhow!("阻止回路"))?
+                    }
+                    let dest_link_addr = dest_client_info.address;
+                    let server_secret = dest_client_info.server_secret;
+                    Ok((
+                        server_secret,
+                        dest_link_addr,
+                        self.controller
+                            .get_tcp_sender(&self.group_id, dest_client_info.virtual_ip),
+                        self.controller
+                            .get_wg_sender(&self.group_id, dest_client_info.virtual_ip),
+                    ))
+                } else {
+                    Err(anyhow!("目标未注册"))
                 }
-                if !dest_client_info.virtual_ip == u32::from(self.ip) {
-                    Err(anyhow!("阻止回路"))?
-                }
-                let dest_link_addr = dest_client_info.address;
-                let server_secret = dest_client_info.server_secret;
-                (
-                    server_secret,
-                    dest_link_addr,
-                    self.controller
-                        .get_tcp_sender(&self.group_id, dest_client_info.virtual_ip),
-                    self.controller
-                        .get_wg_sender(&self.group_id, dest_client_info.virtual_ip),
-                )
-            } else {
-                Err(anyhow!("目标未注册"))?
-            }
-        };
+            })
+            .context("组网已失效")??;
 
         self.send_one(
             peer_addr,

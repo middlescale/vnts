@@ -57,10 +57,6 @@ impl ClientPacketHandler {
         mut net_packet: NetPacket<B>,
     ) -> Result<()> {
         if net_packet.incr_ttl() > 1 {
-            let group_network_info = self
-                .controller
-                .get_network_info(&network_info.group)
-                .ok_or(Error::Disconnect)?;
             if self.config.check_finger {
                 let finger = crate::cipher::Finger::new(&network_info.group);
                 finger.check_finger(&net_packet)?;
@@ -72,22 +68,27 @@ impl ClientPacketHandler {
             } else {
                 let is_encrypt = net_packet.is_encrypt();
                 let source_ip = u32::from(net_packet.source());
-                let rs = group_network_info
-                    .read()
-                    .clients
-                    .get(&destination.into())
-                    .filter(|v| {
-                        v.wireguard.is_none()
-                            && v.online
-                            && v.client_secret == is_encrypt
-                            && v.virtual_ip != source_ip
+                let rs = self
+                    .controller
+                    .with_network_read(&network_info.group, |group_network_info| {
+                        group_network_info
+                            .clients
+                            .get(&destination.into())
+                            .filter(|v| {
+                                v.wireguard.is_none()
+                                    && v.online
+                                    && v.client_secret == is_encrypt
+                                    && v.virtual_ip != source_ip
+                            })
+                            .map(|v| {
+                                (
+                                    v.address,
+                                    self.controller
+                                        .get_tcp_sender(&network_info.group, v.virtual_ip),
+                                )
+                            })
                     })
-                    .map(|v| {
-                        (
-                            v.address,
-                            self.controller.get_tcp_sender(&network_info.group, v.virtual_ip),
-                        )
-                    });
+                    .ok_or(Error::Disconnect)?;
                 if let Some((peer_addr, peer_tcp_sender)) = rs {
                     send_one(&self.udp, peer_addr, peer_tcp_sender, &net_packet).await;
                 }
@@ -101,28 +102,31 @@ impl ClientPacketHandler {
         network_info: &SessionNetworkInfo,
         net_packet: NetPacket<B>,
     ) {
-        let Some(group_network_info) = self.controller.get_network_info(&network_info.group) else {
+        let Some(list) = self
+            .controller
+            .with_network_read(&network_info.group, |group_network_info| {
+                let is_encrypt = net_packet.is_encrypt();
+                let source_ip = u32::from(net_packet.source());
+                group_network_info
+                    .clients
+                    .values()
+                    .filter(|v| {
+                        v.wireguard.is_none()
+                            && v.online
+                            && v.client_secret == is_encrypt
+                            && v.virtual_ip != source_ip
+                    })
+                    .map(|v| {
+                        (
+                            v.address,
+                            self.controller.get_tcp_sender(&network_info.group, v.virtual_ip),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+        else {
             return;
         };
-        let is_encrypt = net_packet.is_encrypt();
-        let source_ip = u32::from(net_packet.source());
-        let list: Vec<_> = group_network_info
-            .read()
-            .clients
-            .values()
-            .filter(|v| {
-                v.wireguard.is_none()
-                    && v.online
-                    && v.client_secret == is_encrypt
-                    && v.virtual_ip != source_ip
-            })
-            .map(|v| {
-                (
-                    v.address,
-                    self.controller.get_tcp_sender(&network_info.group, v.virtual_ip),
-                )
-            })
-            .collect();
         for (peer_addr, peer_tcp_sender) in list {
             send_one(&self.udp, peer_addr, peer_tcp_sender, &net_packet).await;
         }

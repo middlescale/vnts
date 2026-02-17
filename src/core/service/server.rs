@@ -308,15 +308,6 @@ impl ServerPacketHandler {
 }
 
 impl ServerPacketHandler {
-    fn get_network_info(
-        &self,
-        context: &SessionNetworkInfo,
-    ) -> Result<Arc<parking_lot::RwLock<NetworkInfo>>> {
-        self.controller
-            .get_network_info(&context.group)
-            .context("virtual_network is none")
-    }
-
     fn control_ping<B: AsRef<[u8]>>(
         &self,
         net_packet: NetPacket<B>,
@@ -328,8 +319,10 @@ impl ServerPacketHandler {
         packet.set_transport_protocol(control_packet::Protocol::Pong.into());
         packet.set_payload(net_packet.payload())?;
         let mut pong_packet = control_packet::PongPacket::new(packet.payload_mut())?;
-        let network_info = self.get_network_info(network_info)?;
-        let epoch = network_info.read().epoch;
+        let epoch = self
+            .controller
+            .with_network_read(&network_info.group, |network| network.epoch)
+            .context("virtual_network is none")?;
         // 这里给客户端的是丢失精度的，可能导致客户端无法感知变更
         pong_packet.set_epoch(epoch as u16);
         Ok(Some(packet))
@@ -533,11 +526,15 @@ impl ServerPacketHandler {
         _addr: &SocketAddr,
         network_context: &SessionNetworkInfo,
     ) -> Result<Option<NetPacket<Vec<u8>>>> {
-        let network_info = self.get_network_info(network_context)?;
-        let guard = network_info.read();
-        let ips = clients_info(&guard.clients, network_context.virtual_ip);
-        let epoch = guard.epoch;
-        drop(guard);
+        let (ips, epoch) = self
+            .controller
+            .with_network_read(&network_context.group, |network| {
+                (
+                    clients_info(&network.clients, network_context.virtual_ip),
+                    network.epoch,
+                )
+            })
+            .context("virtual_network is none")?;
         let mut device_list = DeviceList::new();
         device_list.epoch = epoch as u32;
         device_list.device_info_list = ips.into_iter().map(|v| v.into()).collect();
@@ -566,15 +563,15 @@ impl ServerPacketHandler {
         status_info.is_cone =
             client_status_info.nat_type.enum_value_or_default() == message::PunchNatType::Cone;
         status_info.update_time = Local::now();
-        if let Ok(network_info) = self.get_network_info(network_info) {
-            if let Some(v) = network_info
-                .write()
-                .clients
-                .get_mut(&client_status_info.source)
-            {
-                v.client_status = Some(status_info);
-            }
-        }
+        if self
+            .controller
+            .with_network_write(&network_info.group, |network| {
+                if let Some(v) = network.clients.get_mut(&client_status_info.source) {
+                    v.client_status = Some(status_info);
+                }
+            })
+            .is_some()
+        {}
     }
     async fn wg_ipv4<B: AsRef<[u8]>>(
         &self,
@@ -587,26 +584,39 @@ impl ServerPacketHandler {
         if destination == context.virtual_ip {
             return Ok(());
         }
-        let network_info = self.get_network_info(context)?;
+        let peers = self
+            .controller
+            .with_network_read(&context.group, |network| {
+                if dest.is_broadcast() || dest == context.broadcast {
+                    network
+                        .clients
+                        .values()
+                        .filter(|peer| peer.online && destination != peer.virtual_ip)
+                        .map(|peer| peer.virtual_ip)
+                        .collect::<Vec<_>>()
+                } else {
+                    network
+                        .clients
+                        .get(&destination)
+                        .filter(|peer| peer.online)
+                        .map(|peer| vec![peer.virtual_ip])
+                        .unwrap_or_default()
+                }
+            })
+            .context("virtual_network is none")?;
         if dest.is_broadcast() || dest == context.broadcast {
             // 广播
-            for peer in network_info.read().clients.values() {
-                if !peer.online || destination == peer.virtual_ip {
-                    continue;
-                }
-                if let Some(sender) = self.controller.get_wg_sender(&context.group, peer.virtual_ip) {
+            for peer_ip in peers {
+                if let Some(sender) = self.controller.get_wg_sender(&context.group, peer_ip) {
                     if let Err(e) = sender.try_send((net_packet.payload().to_vec(), source)) {
                         log::info!("广播到对端wg失败 {}->{},{}", source, dest, e);
                     }
                 }
             }
-        } else if let Some(peer) = network_info.read().clients.get(&destination) {
-            // 点对点
-            if peer.online {
-                if let Some(sender) = self.controller.get_wg_sender(&context.group, destination) {
-                    if let Err(e) = sender.try_send((net_packet.payload().to_vec(), source)) {
-                        log::info!("发送到对端wg失败 {}->{},{}", source, dest, e);
-                    }
+        } else if let Some(peer_ip) = peers.first().copied() {
+            if let Some(sender) = self.controller.get_wg_sender(&context.group, peer_ip) {
+                if let Err(e) = sender.try_send((net_packet.payload().to_vec(), source)) {
+                    log::info!("发送到对端wg失败 {}->{},{}", source, dest, e);
                 }
             }
         }
@@ -618,26 +628,35 @@ impl ServerPacketHandler {
         net_packet: NetPacket<B>,
         exclude: &[Ipv4Addr],
     ) -> io::Result<()> {
-        let network_info = self
+        let targets = self
             .controller
-            .get_network_info(&context.group)
+            .with_network_read(&context.group, |network_info| {
+                let client_secret = net_packet.is_encrypt();
+                let destination = u32::from(net_packet.destination());
+                network_info
+                    .clients
+                    .iter()
+                    .filter(|(ip, client_info)| {
+                        client_info.online
+                            && destination != **ip
+                            && client_info.client_secret == client_secret
+                            && client_info.wireguard.is_none()
+                            && !exclude.contains(&(**ip).into())
+                    })
+                    .map(|(ip, client_info)| {
+                        (
+                            client_info.address,
+                            self.controller.get_tcp_sender(&context.group, *ip),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "virtual_network is none"))?;
-        let client_secret = net_packet.is_encrypt();
-        let destination = u32::from(net_packet.destination());
-        for (ip, client_info) in &network_info.read().clients {
-            if client_info.online
-                && destination != *ip
-                && client_info.client_secret == client_secret
-                && client_info.wireguard.is_none()
-                && !exclude.contains(&(*ip).into())
-            {
-                if let Some(sender) = self.controller.get_tcp_sender(&context.group, *ip) {
-                    let _ = sender.try_send(net_packet.buffer().to_vec());
-                } else {
-                    let _ = self
-                        .udp
-                        .try_send_to(net_packet.buffer(), client_info.address);
-                }
+        for (peer_addr, sender) in targets {
+            if let Some(sender) = sender {
+                let _ = sender.try_send(net_packet.buffer().to_vec());
+            } else {
+                let _ = self.udp.try_send_to(net_packet.buffer(), peer_addr);
             }
         }
         Ok(())
@@ -695,106 +714,107 @@ pub async fn generate_ip(
     let runtime_group_id = register_request.group_id.clone();
     let group_id = register_request.group_id;
     let tcp_sender = register_request.tcp_sender.clone();
-    let v = controller
-        .get_or_create_network_info(group_id, || {
-            (
-                Duration::from_secs(7 * 24 * 3600),
-                Arc::new(parking_lot::const_rwlock(NetworkInfo::new(
-                    network, netmask, gateway,
-                ))),
-            )
-        })
-        .await;
-    // 可分配的ip段
-    let ip_range = network + 1..gateway | (!netmask);
-    let timestamp = Local::now().timestamp();
-    let mut lock = v.write();
-    let mut insert = true;
-    if virtual_ip != 0 {
-        if gateway == virtual_ip || !ip_range.contains(&virtual_ip) {
-            Err(Error::InvalidIp)?
-        }
-        //指定了ip
-        if let Some(info) = lock.clients.get_mut(&virtual_ip) {
-            if info.device_id != device_id {
-                //ip被占用了,并且不能更改ip
-                if !allow_ip_change {
-                    Err(Error::IpAlreadyExists)?
+    controller
+        .with_or_create_network_write(
+            group_id,
+            || {
+                (
+                    Duration::from_secs(7 * 24 * 3600),
+                    NetworkInfo::new(network, netmask, gateway),
+                )
+            },
+            |lock| {
+                // 可分配的ip段
+                let ip_range = network + 1..gateway | (!netmask);
+                let timestamp = Local::now().timestamp();
+                let mut insert = true;
+                if virtual_ip != 0 {
+                    if gateway == virtual_ip || !ip_range.contains(&virtual_ip) {
+                        Err(Error::InvalidIp)?
+                    }
+                    //指定了ip
+                    if let Some(info) = lock.clients.get_mut(&virtual_ip) {
+                        if info.device_id != device_id {
+                            //ip被占用了,并且不能更改ip
+                            if !allow_ip_change {
+                                Err(Error::IpAlreadyExists)?
+                            }
+                            // 重新挑选ip
+                            virtual_ip = 0;
+                        } else {
+                            insert = false;
+                        }
+                    }
                 }
-                // 重新挑选ip
-                virtual_ip = 0;
-            } else {
-                insert = false;
-            }
-        }
-    }
-    let mut old_ip = 0;
-    if insert {
-        // 找到上一次用的ip
-        for (ip, x) in &lock.clients {
-            if x.device_id == device_id {
-                if virtual_ip == 0 {
-                    virtual_ip = *ip;
-                } else {
-                    old_ip = *ip;
+                let mut old_ip = 0;
+                if insert {
+                    // 找到上一次用的ip
+                    for (ip, x) in &lock.clients {
+                        if x.device_id == device_id {
+                            if virtual_ip == 0 {
+                                virtual_ip = *ip;
+                            } else {
+                                old_ip = *ip;
+                            }
+                            break;
+                        }
+                    }
                 }
-                break;
-            }
-        }
-    }
 
-    if virtual_ip == 0 {
-        // 从小到大找一个未使用的ip
-        for ip in ip_range {
-            if ip == lock.gateway_ip {
-                continue;
-            }
-            if !lock.clients.contains_key(&ip) {
-                virtual_ip = ip;
-                break;
-            }
-        }
-    }
-    if virtual_ip == 0 {
-        log::error!("地址使用完:{:?}", lock);
-        Err(Error::AddressExhausted)?
-    }
-    let info = if old_ip == 0 {
-        lock.clients
-            .entry(virtual_ip)
-            .or_insert_with(ClientInfo::default)
-    } else {
-        let client_info = lock.clients.remove(&old_ip).unwrap();
-        lock.clients
-            .entry(virtual_ip)
-            .or_insert_with(|| client_info)
-    };
-    info.name = register_request.name;
-    info.device_id = device_id;
-    info.version = register_request.version;
-    info.client_secret = register_request.client_secret;
-    info.client_secret_hash = register_request.client_secret_hash;
-    info.server_secret = register_request.server_secret;
-    info.address = register_request.address;
-    info.online = register_request.online;
-    info.wireguard = register_request.wireguard;
-    info.virtual_ip = virtual_ip;
-    info.last_join_time = Local::now();
-    info.timestamp = timestamp;
-    lock.epoch += 1;
-    if old_ip != 0 && old_ip != virtual_ip {
-        controller.set_tcp_sender(&runtime_group_id, old_ip, None);
-        controller.set_wg_sender(&runtime_group_id, old_ip, None);
-    }
-    controller.set_tcp_sender(&runtime_group_id, virtual_ip, tcp_sender);
-    controller.set_wg_sender(&runtime_group_id, virtual_ip, None);
-    let response = RegisterClientResponse {
-        timestamp,
-        virtual_ip: virtual_ip.into(),
-        epoch: lock.epoch,
-        client_list: clients_info(&lock.clients, virtual_ip),
-    };
-    Ok(response)
+                if virtual_ip == 0 {
+                    // 从小到大找一个未使用的ip
+                    for ip in ip_range {
+                        if ip == lock.gateway_ip {
+                            continue;
+                        }
+                        if !lock.clients.contains_key(&ip) {
+                            virtual_ip = ip;
+                            break;
+                        }
+                    }
+                }
+                if virtual_ip == 0 {
+                    log::error!("地址使用完:{:?}", lock);
+                    Err(Error::AddressExhausted)?
+                }
+                let info = if old_ip == 0 {
+                    lock.clients
+                        .entry(virtual_ip)
+                        .or_insert_with(ClientInfo::default)
+                } else {
+                    let client_info = lock.clients.remove(&old_ip).unwrap();
+                    lock.clients
+                        .entry(virtual_ip)
+                        .or_insert_with(|| client_info)
+                };
+                info.name = register_request.name;
+                info.device_id = device_id;
+                info.version = register_request.version;
+                info.client_secret = register_request.client_secret;
+                info.client_secret_hash = register_request.client_secret_hash;
+                info.server_secret = register_request.server_secret;
+                info.address = register_request.address;
+                info.online = register_request.online;
+                info.wireguard = register_request.wireguard;
+                info.virtual_ip = virtual_ip;
+                info.last_join_time = Local::now();
+                info.timestamp = timestamp;
+                lock.epoch += 1;
+                if old_ip != 0 && old_ip != virtual_ip {
+                    controller.set_tcp_sender(&runtime_group_id, old_ip, None);
+                    controller.set_wg_sender(&runtime_group_id, old_ip, None);
+                }
+                controller.set_tcp_sender(&runtime_group_id, virtual_ip, tcp_sender);
+                controller.set_wg_sender(&runtime_group_id, virtual_ip, None);
+                Ok(RegisterClientResponse {
+                    timestamp,
+                    virtual_ip: virtual_ip.into(),
+                    epoch: lock.epoch,
+                    client_list: clients_info(&lock.clients, virtual_ip),
+                })
+            },
+        )
+        .await
 }
 fn clients_info(clients: &HashMap<u32, ClientInfo>, current_ip: u32) -> Vec<SimpleClientInfo> {
     clients
