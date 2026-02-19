@@ -16,8 +16,7 @@ use crate::core::server::web::vo::req::{CreateWGData, CreateWgConfig, LoginData,
 use crate::core::server::web::vo::res::{
     ClientInfo, ClientStatusInfo, GroupList, NetworkInfo, WGData, WgConfig,
 };
-use crate::core::service::server::{generate_ip, RegisterClientRequest};
-use crate::core::control::controller::Controller;
+use crate::core::control::controller::{Controller, RegisterClientRequest};
 use crate::ConfigInfo;
 
 #[derive(Clone)]
@@ -136,7 +135,7 @@ impl VntsWebService {
             online: false,
             wireguard: Some(public_key),
         };
-        let response = generate_ip(cache, register_client_request).await?;
+        let response = cache.generate_ip(register_client_request).await?;
         let wireguard_config = WireGuardConfig {
             vnts_endpoint: wg_data.config.vnts_endpoint.clone(),
             vnts_allowed_ips: network.to_string(),

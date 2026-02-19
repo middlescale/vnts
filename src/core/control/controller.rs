@@ -1,13 +1,17 @@
+use chrono::Local;
 use dashmap::DashMap;
 use parking_lot::RwLock;
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 
 use crate::cipher::Aes256GcmCipher;
 use crate::core::control::expire_map::ExpireMap;
-use crate::core::entity::{NetworkInfo, SimpleClientInfo, WireGuardConfig};
+use crate::core::entity::{ClientInfo, NetworkInfo, SimpleClientInfo, WireGuardConfig};
+use crate::error::Error;
 
 pub struct VntSession {
     network_info: Option<SessionNetworkInfo>,
@@ -105,6 +109,43 @@ pub struct ClientRuntime {
     pub wg_sender: Option<Sender<(Vec<u8>, Ipv4Addr)>>,
 }
 
+pub struct RegisterClientRequest {
+    pub group_id: String,
+    // ip 0表示自动分配
+    pub virtual_ip: Ipv4Addr,
+    pub gateway: Ipv4Addr,
+    pub netmask: Ipv4Addr,
+    // 允许分配不一样的ip
+    pub allow_ip_change: bool,
+    // 设备ID
+    pub device_id: String,
+    // 版本
+    pub version: String,
+    // 名称
+    pub name: String,
+    // 客户端间是否加密
+    pub client_secret: bool,
+    // 加密hash
+    pub client_secret_hash: Vec<u8>,
+    // 和服务端是否加密
+    pub server_secret: bool,
+    // 链接服务器的来源地址
+    pub address: SocketAddr,
+    pub tcp_sender: Option<Sender<Vec<u8>>>,
+    // 是否在线
+    pub online: bool,
+    // wireguard客户端公钥
+    pub wireguard: Option<[u8; 32]>,
+}
+
+pub struct RegisterClientResponse {
+    pub timestamp: i64,
+    pub virtual_ip: Ipv4Addr,
+    // 纪元号
+    pub epoch: u64,
+    pub client_list: Vec<SimpleClientInfo>,
+}
+
 impl Controller {
     pub fn new() -> Self {
         let wg_group_map: Arc<DashMap<[u8; 32], WireGuardConfig>> = Default::default();
@@ -157,19 +198,23 @@ impl Controller {
     where
         F: FnOnce(&NetworkInfo) -> T,
     {
-        self.virtual_network.get(&group.to_string()).map(|network_info| {
-            let guard = network_info.read();
-            f(&guard)
-        })
+        self.virtual_network
+            .get(&group.to_string())
+            .map(|network_info| {
+                let guard = network_info.read();
+                f(&guard)
+            })
     }
     pub fn with_network_write<T, F>(&self, group: &str, f: F) -> Option<T>
     where
         F: FnOnce(&mut NetworkInfo) -> T,
     {
-        self.virtual_network.get(&group.to_string()).map(|network_info| {
-            let mut guard = network_info.write();
-            f(&mut guard)
-        })
+        self.virtual_network
+            .get(&group.to_string())
+            .map(|network_info| {
+                let mut guard = network_info.write();
+                f(&mut guard)
+            })
     }
     pub fn remove_network<T, F>(&self, group: &str, f: F) -> Option<T>
     where
@@ -197,17 +242,17 @@ impl Controller {
             .key_values()
             .into_iter()
             .map(|(group, network_info)| {
-                let clients = network_info.read().clients.values().map(SimpleClientInfo::from).collect();
+                let clients = network_info
+                    .read()
+                    .clients
+                    .values()
+                    .map(SimpleClientInfo::from)
+                    .collect();
                 (group, clients)
             })
             .collect()
     }
-    pub async fn with_or_create_network_write<T, C, F>(
-        &self,
-        group: String,
-        create: C,
-        f: F,
-    ) -> T
+    pub async fn with_or_create_network_write<T, C, F>(&self, group: String, create: C, f: F) -> T
     where
         C: FnOnce() -> (Duration, NetworkInfo),
         F: FnOnce(&mut NetworkInfo) -> T,
@@ -299,4 +344,183 @@ impl Controller {
             self.client_runtime.insert(key, runtime);
         }
     }
+
+    pub async fn generate_ip(
+        &self,
+        register_request: RegisterClientRequest,
+    ) -> anyhow::Result<RegisterClientResponse> {
+        let gateway: u32 = register_request.gateway.into();
+        let netmask: u32 = register_request.netmask.into();
+        let network: u32 = gateway & netmask;
+        let mut virtual_ip: u32 = register_request.virtual_ip.into();
+        let device_id = register_request.device_id;
+        let allow_ip_change = register_request.allow_ip_change;
+        let runtime_group_id = register_request.group_id.clone();
+        let group_id = register_request.group_id;
+        let tcp_sender = register_request.tcp_sender.clone();
+
+        self.with_or_create_network_write(
+            group_id,
+            || {
+                (
+                    Duration::from_secs(7 * 24 * 3600),
+                    NetworkInfo::new(network, netmask, gateway),
+                )
+            },
+            |network_info| {
+                // 可分配的ip段
+                let ip_range = network + 1..gateway | (!netmask);
+                let timestamp = Local::now().timestamp();
+                let old_ip = Self::resolve_old_ip_and_requested_ip(
+                    network_info,
+                    gateway,
+                    &ip_range,
+                    &mut virtual_ip,
+                    &device_id,
+                    allow_ip_change,
+                )?;
+
+                Self::allocate_virtual_ip_if_needed(network_info, &ip_range, &mut virtual_ip)?;
+
+                let client_info = if old_ip == 0 {
+                    network_info
+                        .clients
+                        .entry(virtual_ip)
+                        .or_insert_with(ClientInfo::default)
+                } else {
+                    let client_info = network_info.clients.remove(&old_ip).unwrap();
+                    network_info
+                        .clients
+                        .entry(virtual_ip)
+                        .or_insert_with(|| client_info)
+                };
+                client_info.name = register_request.name;
+                client_info.device_id = device_id;
+                client_info.version = register_request.version;
+                client_info.client_secret = register_request.client_secret;
+                client_info.client_secret_hash = register_request.client_secret_hash;
+                client_info.server_secret = register_request.server_secret;
+                client_info.address = register_request.address;
+                client_info.online = register_request.online;
+                client_info.wireguard = register_request.wireguard;
+                client_info.virtual_ip = virtual_ip;
+                client_info.last_join_time = Local::now();
+                client_info.timestamp = timestamp;
+
+                network_info.epoch += 1;
+
+                if old_ip != 0 && old_ip != virtual_ip {
+                    self.set_tcp_sender(&runtime_group_id, old_ip, None);
+                    self.set_wg_sender(&runtime_group_id, old_ip, None);
+                }
+                self.set_tcp_sender(&runtime_group_id, virtual_ip, tcp_sender);
+                self.set_wg_sender(&runtime_group_id, virtual_ip, None);
+                Ok(RegisterClientResponse {
+                    timestamp,
+                    virtual_ip: virtual_ip.into(),
+                    epoch: network_info.epoch,
+                    client_list: clients_info(&network_info.clients, virtual_ip),
+                })
+            },
+        )
+        .await
+    }
+
+    fn resolve_old_ip_and_requested_ip(
+        lock: &mut NetworkInfo,
+        gateway: u32,
+        ip_range: &Range<u32>,
+        virtual_ip: &mut u32,
+        device_id: &str,
+        allow_ip_change: bool,
+    ) -> anyhow::Result<u32> {
+        let insert = Self::handle_requested_ip(
+            lock,
+            gateway,
+            ip_range,
+            virtual_ip,
+            device_id,
+            allow_ip_change,
+        )?;
+        if !insert {
+            return Ok(0);
+        }
+        Ok(Self::reuse_previous_device_ip(lock, virtual_ip, device_id))
+    }
+
+    fn handle_requested_ip(
+        lock: &mut NetworkInfo,
+        gateway: u32,
+        ip_range: &Range<u32>,
+        virtual_ip: &mut u32,
+        device_id: &str,
+        allow_ip_change: bool,
+    ) -> anyhow::Result<bool> {
+        if *virtual_ip == 0 {
+            return Ok(true);
+        }
+        if gateway == *virtual_ip || !ip_range.contains(virtual_ip) {
+            Err(Error::InvalidIp)?
+        }
+        //指定了ip
+        if let Some(info) = lock.clients.get_mut(virtual_ip) {
+            if info.device_id != device_id {
+                //ip被占用了,并且不能更改ip
+                if !allow_ip_change {
+                    Err(Error::IpAlreadyExists)?
+                }
+                // 重新挑选ip
+                *virtual_ip = 0;
+            } else {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn reuse_previous_device_ip(lock: &NetworkInfo, virtual_ip: &mut u32, device_id: &str) -> u32 {
+        // 找到上一次用的ip
+        for (ip, x) in &lock.clients {
+            if x.device_id == device_id {
+                if *virtual_ip == 0 {
+                    *virtual_ip = *ip;
+                    return 0;
+                }
+                return *ip;
+            }
+        }
+        0
+    }
+
+    fn allocate_virtual_ip_if_needed(
+        lock: &NetworkInfo,
+        ip_range: &Range<u32>,
+        virtual_ip: &mut u32,
+    ) -> anyhow::Result<()> {
+        if *virtual_ip == 0 {
+            // 从小到大找一个未使用的ip
+            for ip in ip_range.clone() {
+                if ip == lock.gateway_ip {
+                    continue;
+                }
+                if !lock.clients.contains_key(&ip) {
+                    *virtual_ip = ip;
+                    break;
+                }
+            }
+        }
+        if *virtual_ip == 0 {
+            log::error!("地址使用完:{:?}", lock);
+            Err(Error::AddressExhausted)?
+        }
+        Ok(())
+    }
+}
+
+fn clients_info(clients: &HashMap<u32, ClientInfo>, current_ip: u32) -> Vec<SimpleClientInfo> {
+    clients
+        .iter()
+        .filter(|&(_, dev)| dev.virtual_ip != current_ip)
+        .map(|(_, device_info)| device_info.into())
+        .collect()
 }
